@@ -13,3 +13,8 @@ eval_model
 eval_data
 
 .vscode
+
+build
+dist
+emd_ext.egg-info
+*.so
