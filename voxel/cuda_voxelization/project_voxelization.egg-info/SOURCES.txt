@@ -1,8 +1,0 @@
-bindings.cpp
-setup.py
-vox.cpp
-vox_cuda.cu
-project_voxelization.egg-info/PKG-INFO
-project_voxelization.egg-info/SOURCES.txt
-project_voxelization.egg-info/dependency_links.txt
-project_voxelization.egg-info/top_level.txt
