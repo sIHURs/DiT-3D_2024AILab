@@ -16,5 +16,7 @@ eval_data
 
 build
 dist
-emd_ext.egg-info
+voxel/cuda_voxelization/project_voxelization.egg-info
+voxel/cuda_devoxelization/project_devoxelization.egg-info
+*.egg-info
 *.so
