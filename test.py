@@ -32,7 +32,7 @@ def normal_kl(mean1, logvar1, mean2, logvar2):
     return 0.5 * (-1.0 + logvar2 - logvar1 + torch.exp(logvar1 - logvar2)
                 + (mean1 - mean2)**2 * torch.exp(-logvar2))
 
-def discretized_gaussian_log_likelihood(x, *, means, log_scales):
+def discretized_gaussian_log_likelihood(x, *, means, log_scales): # X
     # Assumes data is integers [0, 1]
     assert x.shape == means.shape == log_scales.shape
     px0 = Normal(torch.zeros_like(means), torch.ones_like(log_scales))
@@ -181,6 +181,11 @@ class GaussianDiffusion:
 
     def _predict_xstart_from_eps(self, x_t, t, eps):
         assert x_t.shape == eps.shape
+        # check device
+        # print(t.device) - on cpu
+        # print(x_t.device) - on cpu
+        # print(eps.device)
+        ####
         return (
                 self._extract(self.sqrt_recip_alphas_cumprod.to(x_t.device), t, x_t.shape) * x_t -
                 self._extract(self.sqrt_recipm1_alphas_cumprod.to(x_t.device), t, x_t.shape) * eps
@@ -214,15 +219,16 @@ class GaussianDiffusion:
 
         assert isinstance(shape, (tuple, list))
         img_t = noise_fn(size=shape, dtype=torch.float, device=device)
+        # print("img_t:", img_t.device)
         for t in reversed(range(0, self.num_timesteps if not keep_running else len(self.betas))):
             t_ = torch.empty(shape[0], dtype=torch.int64, device=device).fill_(t)
-            img_t = self.p_sample(denoise_fn=denoise_fn, data=img_t,t=t_, noise_fn=noise_fn, y=y,
+            img_t = self.p_sample(denoise_fn=denoise_fn, data=img_t, t=t_, noise_fn=noise_fn, y=y,
                                   clip_denoised=clip_denoised, return_pred_xstart=False)
 
         assert img_t.shape == shape
         return img_t
 
-    def reconstruct(self, x0, t, y, denoise_fn, noise_fn=torch.randn, constrain_fn=lambda x, t:x):
+    def reconstruct(self, x0, t, y, denoise_fn, noise_fn=torch.randn, constrain_fn=lambda x, t:x): # X
 
         assert t >= 1
 
@@ -578,14 +584,14 @@ def parse_args():
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_dir', type=str, default='./checkpoints', help='path to save trained model weights')
-    parser.add_argument('--experiment_name', type=str, default='dit3d', help='experiment name (used for checkpointing and logging)')
+    parser.add_argument('--experiment_name', type=str, default='shortOutput', help='experiment name (used for checkpointing and logging)')
 
     parser.add_argument('--dataroot', default='ShapeNetCore.v2.PC15k/')
     parser.add_argument('--category', default='chair')
     parser.add_argument('--num_classes', type=int, default=55)
 
     parser.add_argument('--bs', type=int, default=64, help='input batch size')
-    parser.add_argument('--workers', type=int, default=16, help='workers')
+    parser.add_argument('--workers', type=int, default=8, help='workers')
     parser.add_argument('--niter', type=int, default=10000, help='number of epochs to train for')
 
     parser.add_argument('--nc', default=3)

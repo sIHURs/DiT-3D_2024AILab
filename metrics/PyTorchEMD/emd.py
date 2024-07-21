@@ -42,6 +42,5 @@ def earth_mover_distance(xyz1, xyz2, transpose=True):
         xyz1 = xyz1.transpose(1, 2)
         xyz2 = xyz2.transpose(1, 2)
     cost = EarthMoverDistanceFunction.apply(xyz1, xyz2)
-    cost = cost / xyz1.shape[1]
     return cost
 

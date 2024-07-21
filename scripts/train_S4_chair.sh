@@ -1,8 +1,8 @@
 
-python train.py --distribution_type 'multi' \
-    --dataroot /path/to/ShapeNetCore.v2.PC15k/ \
+python train.py --distribution_type 'single' \
+    --dataroot /home/yifan/studium/3D_Completion/DiT-3D_2024AILab/datasets/data/ShapeNetCore.v2.PC15k/ \
     --category chair \
-    --experiment_name /path/to/experiments \
+    --experiment_name experiments/ \
     --model_type 'DiT-S/4' \
     --window_size 4 --window_block_indexes '0,3,6,9' \
     --bs 16 \

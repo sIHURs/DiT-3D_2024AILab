@@ -338,7 +338,7 @@ class GaussianDiffusion:
         """
         Training loss calculation
         """
-        B, D, N = data_start.shape
+        B, D, N = data_start.shape # batch, feature(x, y, z, other features, num_points)
         assert t.shape == torch.Size([B])
 
         if noise is None:
@@ -441,7 +441,7 @@ class Model(nn.Module):
 
 
     def _denoise(self, data, t, y):
-        B, D,N= data.shape
+        B, D, N= data.shape
         assert data.dtype == torch.float
         assert t.shape == torch.Size([B]) and t.dtype == torch.int64
 

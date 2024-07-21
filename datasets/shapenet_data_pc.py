@@ -83,6 +83,8 @@ class Uniform15KPC(Dataset):
                     continue
 
                 assert point_cloud.shape[0] == 15000
+
+                # get all the point to a list? will it cause a Cuda out of memory?
                 self.all_points.append(point_cloud[np.newaxis, ...])
                 self.cate_idx_lst.append(cate_idx)
                 self.all_cate_mids.append((subd, mid))
@@ -95,7 +97,7 @@ class Uniform15KPC(Dataset):
         self.all_cate_mids = [self.all_cate_mids[i] for i in self.shuffle_idx]
 
         # Normalization
-        self.all_points = np.concatenate(self.all_points)  # (N, 15000, 3)
+        self.all_points = np.concatenate(self.all_points)  # (N, 15000, 3), converge to one tensor, before is a list
         self.normalize_per_shape = normalize_per_shape
         self.normalize_std_per_axis = normalize_std_per_axis
         if all_points_mean is not None and all_points_std is not None:  # using loaded dataset stats

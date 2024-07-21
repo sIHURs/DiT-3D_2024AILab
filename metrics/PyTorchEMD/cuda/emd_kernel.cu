@@ -11,9 +11,19 @@
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAApplyUtils.cuh>  // at::cuda::getApplyGrid
-#include <THC/THC.h>
 
-#define CHECK_CUDA(x) TORCH_CHECK(x.type().is_cuda(), #x " must be a CUDA tensor")
+// <THC/THC.h> is remove in new version
+// solution: https://github.com/CoinCheung/pytorch-loss/pull/37, https://github.com/vacancy/PreciseRoIPooling/commit/f75570ae05aea68a2ebc100f60a54194b0a9d15c
+// #include <THC/THC.h>
+
+// the error below with CHECK_EQ CHECK_INPUT
+// follow the change from here https://git.fainsin.bzh/Safran/PVD/commit/e10fd5a3ebb4e0e6ac04f0c0cc5c0404b06dfc73?style=split&whitespace=show-all&show-outdated=
+
+
+// #define CHECK_CUDA(x) AT_CHECK(x.type().is_cuda(), #x " must be a CUDA tensor")
+// #define CHECK_CONTIGUOUS(x) AT_CHECK(x.is_contiguous(), #x " must be contiguous")
+// #define CHECK_INPUT(x) CHECK_CUDA(x); CHECK_CONTIGUOUS(x)
+#define CHECK_CUDA(x) TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 #define CHECK_INPUT(x) CHECK_CUDA(x); CHECK_CONTIGUOUS(x)
 
@@ -171,25 +181,29 @@ Output:
 at::Tensor ApproxMatchForward(
     const at::Tensor xyz1,
     const at::Tensor xyz2){
-  const auto b = xyz1.size(0);
-  const auto n = xyz1.size(1);
-  const auto m = xyz2.size(1);
+		const auto b = xyz1.size(0);
+		const auto n = xyz1.size(1);
+		const auto m = xyz2.size(1);
 
-  CHECK_EQ(xyz2.size(0), b);
-  CHECK_EQ(xyz1.size(2), 3);
-  CHECK_EQ(xyz2.size(2), 3);
-  CHECK_INPUT(xyz1);
-  CHECK_INPUT(xyz2);
+		//   CHECK_EQ(xyz2.size(0), b);
+		//   CHECK_EQ(xyz1.size(2), 3);
+		//   CHECK_EQ(xyz2.size(2), 3);
+		TORCH_CHECK_EQ(xyz2.size(0), b);
+		TORCH_CHECK_EQ(xyz1.size(2), 3);
+		TORCH_CHECK_EQ(xyz2.size(2), 3);
+		CHECK_INPUT(xyz1);
+		CHECK_INPUT(xyz2);
 
-  auto match = at::zeros({b, m, n}, xyz1.type());
-  auto temp = at::zeros({b, (n+m)*2}, xyz1.type());
+		auto match = at::zeros({b, m, n}, xyz1.type());
+		auto temp = at::zeros({b, (n+m)*2}, xyz1.type());
 
-  AT_DISPATCH_FLOATING_TYPES(xyz1.scalar_type(), "ApproxMatchForward", ([&] {
-        approxmatch<scalar_t><<<32,512>>>(b, n, m, xyz1.data<scalar_t>(), xyz2.data<scalar_t>(), match.data<scalar_t>(), temp.data<scalar_t>());
-  }));
-  THCudaCheck(cudaGetLastError());
+		AT_DISPATCH_FLOATING_TYPES(xyz1.scalar_type(), "ApproxMatchForward", ([&] {
+				approxmatch<scalar_t><<<32,512>>>(b, n, m, xyz1.data<scalar_t>(), xyz2.data<scalar_t>(), match.data<scalar_t>(), temp.data<scalar_t>());
+		}));
+		//   THCudaCheck(cudaGetLastError());
+		AT_CUDA_CHECK(cudaGetLastError());
 
-  return match;
+		return match;
 }
 
 
@@ -258,24 +272,27 @@ at::Tensor MatchCostForward(
     const at::Tensor xyz1,
     const at::Tensor xyz2,
     const at::Tensor match){
-  const auto b = xyz1.size(0);
-  const auto n = xyz1.size(1);
-  const auto m = xyz2.size(1);
+  		const auto b = xyz1.size(0);
+  		const auto n = xyz1.size(1);
+  		const auto m = xyz2.size(1);
+	
+  	// CHECK_EQ(xyz2.size(0), b);
+  	// CHECK_EQ(xyz1.size(2), 3);
+  	// CHECK_EQ(xyz2.size(2), 3);
+	TORCH_CHECK_EQ(xyz2.size(0), b);
+  	TORCH_CHECK_EQ(xyz1.size(2), 3);
+  	TORCH_CHECK_EQ(xyz2.size(2), 3);
+  	CHECK_INPUT(xyz1);
+  	CHECK_INPUT(xyz2);
 
-  CHECK_EQ(xyz2.size(0), b);
-  CHECK_EQ(xyz1.size(2), 3);
-  CHECK_EQ(xyz2.size(2), 3);
-  CHECK_INPUT(xyz1);
-  CHECK_INPUT(xyz2);
+	auto cost = at::zeros({b}, xyz1.type());
 
-  auto cost = at::zeros({b}, xyz1.type());
-
-  AT_DISPATCH_FLOATING_TYPES(xyz1.scalar_type(), "MatchCostForward", ([&] {
-        matchcost<scalar_t><<<32,512>>>(b, n, m, xyz1.data<scalar_t>(), xyz2.data<scalar_t>(), match.data<scalar_t>(), cost.data<scalar_t>());
-  }));
-  THCudaCheck(cudaGetLastError());
-
-  return cost;
+	AT_DISPATCH_FLOATING_TYPES(xyz1.scalar_type(), "MatchCostForward", ([&] {
+			matchcost<scalar_t><<<32,512>>>(b, n, m, xyz1.data<scalar_t>(), xyz2.data<scalar_t>(), match.data<scalar_t>(), cost.data<scalar_t>());
+	}));
+	// THCudaCheck(cudaGetLastError());
+	AT_CUDA_CHECK(cudaGetLastError());
+	return cost;
 }
 
 
@@ -375,26 +392,30 @@ std::vector<at::Tensor> MatchCostBackward(
     const at::Tensor xyz1,
     const at::Tensor xyz2,
     const at::Tensor match){
-  const auto b = xyz1.size(0);
-  const auto n = xyz1.size(1);
-  const auto m = xyz2.size(1);
+		const auto b = xyz1.size(0);
+		const auto n = xyz1.size(1);
+		const auto m = xyz2.size(1);
+			
+		//   CHECK_EQ(xyz2.size(0), b);
+		//   CHECK_EQ(xyz1.size(2), 3);
+		//   CHECK_EQ(xyz2.size(2), 3);
+		TORCH_CHECK_EQ(xyz2.size(0), b);
+		TORCH_CHECK_EQ(xyz1.size(2), 3);
+		TORCH_CHECK_EQ(xyz2.size(2), 3);
+		CHECK_INPUT(xyz1);
+		CHECK_INPUT(xyz2);
 
-  CHECK_EQ(xyz2.size(0), b);
-  CHECK_EQ(xyz1.size(2), 3);
-  CHECK_EQ(xyz2.size(2), 3);
-  CHECK_INPUT(xyz1);
-  CHECK_INPUT(xyz2);
+		auto grad1 = at::zeros({b, n, 3}, xyz1.type());
+		auto grad2 = at::zeros({b, m, 3}, xyz1.type());
 
-  auto grad1 = at::zeros({b, n, 3}, xyz1.type());
-  auto grad2 = at::zeros({b, m, 3}, xyz1.type());
+		AT_DISPATCH_FLOATING_TYPES(xyz1.scalar_type(), "MatchCostBackward", ([&] {
+				matchcostgrad1<scalar_t><<<32,512>>>(b, n, m, grad_cost.data<scalar_t>(), xyz1.data<scalar_t>(), xyz2.data<scalar_t>(), match.data<scalar_t>(), grad1.data<scalar_t>());
+				matchcostgrad2<scalar_t><<<dim3(32,32),256>>>(b, n, m, grad_cost.data<scalar_t>(), xyz1.data<scalar_t>(), xyz2.data<scalar_t>(), match.data<scalar_t>(), grad2.data<scalar_t>());
+		}));
+		//   THCudaCheck(cudaGetLastError());
+		AT_CUDA_CHECK(cudaGetLastError());
 
-  AT_DISPATCH_FLOATING_TYPES(xyz1.scalar_type(), "MatchCostBackward", ([&] {
-        matchcostgrad1<scalar_t><<<32,512>>>(b, n, m, grad_cost.data<scalar_t>(), xyz1.data<scalar_t>(), xyz2.data<scalar_t>(), match.data<scalar_t>(), grad1.data<scalar_t>());
-        matchcostgrad2<scalar_t><<<dim3(32,32),256>>>(b, n, m, grad_cost.data<scalar_t>(), xyz1.data<scalar_t>(), xyz2.data<scalar_t>(), match.data<scalar_t>(), grad2.data<scalar_t>());
-  }));
-  THCudaCheck(cudaGetLastError());
-
-  return std::vector<at::Tensor>({grad1, grad2});
-}
+		return std::vector<at::Tensor>({grad1, grad2});
+	}	
 
 #endif

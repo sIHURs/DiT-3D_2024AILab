@@ -1,6 +1,7 @@
 from torch.autograd import Function
 
-from modules.functional.backend import _backend
+# from modules.functional.backend import _backend
+import project_devoxelization
 
 __all__ = ['trilinear_devoxelize']
 
@@ -20,7 +21,7 @@ class TrilinearDevoxelization(Function):
         B, C = features.shape[:2]
         features = features.contiguous().view(B, C, -1)
         coords = coords.contiguous()
-        outs, inds, wgts = _backend.trilinear_devoxelize_forward(resolution, is_training, coords, features)
+        outs, inds, wgts = project_devoxelization.trilinear_devoxelize_forward(resolution, is_training, coords, features)
         if is_training:
             ctx.save_for_backward(inds, wgts)
             ctx.r = resolution
@@ -35,7 +36,7 @@ class TrilinearDevoxelization(Function):
             gradient of inputs, FloatTensor[B, C, R, R, R]
         """
         inds, wgts = ctx.saved_tensors
-        grad_inputs = _backend.trilinear_devoxelize_backward(grad_output.contiguous(), inds, wgts, ctx.r)
+        grad_inputs = project_devoxelization.trilinear_devoxelize_backward(grad_output.contiguous(), inds, wgts, ctx.r)
         return grad_inputs.view(grad_output.size(0), grad_output.size(1), ctx.r, ctx.r, ctx.r), None, None, None
 
 

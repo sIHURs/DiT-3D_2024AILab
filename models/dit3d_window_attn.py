@@ -8,6 +8,8 @@
 # GLIDE: https://github.com/openai/glide-text2im
 # MAE: https://github.com/facebookresearch/mae/blob/main/models_mae.py
 # --------------------------------------------------------
+import sys
+sys.path.append('/home/yifan/studium/3D_Completion/DiT-3D_2024AILab/models')
 
 import torch
 import torch.nn as nn
@@ -16,8 +18,14 @@ import math
 from timm.models.layers import to_2tuple
 from timm.models.vision_transformer import PatchEmbed, Mlp
 
-from modules.voxelization import Voxelization
-import modules.functional as F
+# from modules.voxelization import Voxelization
+# import modules.functional as F
+from voxel.voxelization_layer import Voxelization
+from voxel.devoxelization import trilinear_devoxelize
+
+# use adaptformer for trainig (completion task)
+from adapter import Adapter
+
 
 from utils_vit import *
 
@@ -195,7 +203,10 @@ class DiTBlock(nn.Module):
                  rel_pos_zero_init=True,
                  window_size=0,
                  use_residual_block=False,
-                 input_size=None, **block_kwargs):
+                 input_size=None, 
+                 use_adaptformer=False,
+                 adapt_bottleneck=64,
+                 **block_kwargs):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.attn = Attention(
@@ -220,6 +231,9 @@ class DiTBlock(nn.Module):
         )
 
         self.window_size = window_size
+
+        if use_adaptformer:
+            self.adaptmlp = Adapter(dropout=0.1, bottleneck=adapt_bottleneck)
 
     def forward(self, x, c):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
@@ -246,8 +260,12 @@ class DiTBlock(nn.Module):
         x = x.reshape(B, self.input_size[0] * self.input_size[1] * self.input_size[2], -1)
 
         x = shortcut + gate_msa.unsqueeze(1) * x
+
+        # parallel add adaptformer
+        adapt_x = self.adaptmlp(x, add_residual=False)
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
-        
+        x = x + adapt_x
+
         return x
 
 
@@ -290,7 +308,8 @@ class DiT(nn.Module):
         window_size=0,
         window_block_indexes=(),
         use_rel_pos=False,
-        rel_pos_zero_init=True
+        rel_pos_zero_init=True,
+        adaptformer=False
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -318,7 +337,8 @@ class DiT(nn.Module):
                      use_rel_pos=use_rel_pos,
                      rel_pos_zero_init=rel_pos_zero_init,
                      window_size=window_size if i in window_block_indexes else 0,
-                     input_size=(input_size // patch_size, input_size // patch_size, input_size // patch_size)
+                     input_size=(input_size // patch_size, input_size // patch_size, input_size // patch_size),
+                     use_adaptformer=adaptformer
                      ) for i in range(depth)
         ])
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
@@ -399,7 +419,7 @@ class DiT(nn.Module):
         x = self.unpatchify_voxels(x)           
 
         # Devoxelization
-        x = F.trilinear_devoxelize(x, voxel_coords, self.input_size, self.training)
+        x = trilinear_devoxelize(x, voxel_coords, self.input_size, self.training)
 
         return x
 

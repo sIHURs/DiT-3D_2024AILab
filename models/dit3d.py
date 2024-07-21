@@ -9,6 +9,9 @@
 # MAE: https://github.com/facebookresearch/mae/blob/main/models_mae.py
 # --------------------------------------------------------
 
+import sys
+sys.path.append('/home/yifan/studium/3D_Completion/DiT-3D_2024AILab/models')
+
 import torch
 import torch.nn as nn
 import numpy as np
@@ -16,8 +19,13 @@ import math
 from timm.models.layers import to_2tuple
 from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
 
-from modules.voxelization import Voxelization
-import modules.functional as F
+# from modules.voxelization import Voxelization
+# import modules.functional as F
+from voxel.voxelization_layer import Voxelization
+from voxel.devoxelization import trilinear_devoxelize
+
+# use adaptformer for trainig (completion task)
+from adapter import Adapter
 
 
 def modulate(x, shift, scale):
@@ -47,6 +55,7 @@ class PatchEmbed_Voxel(nn.Module):
         B, C, X, Y, Z = x.shape
         x = x.float()
         x = self.proj(x).flatten(2).transpose(1, 2)
+        # x - torch.Size([1, 512, 768])
         return x
     
 
@@ -121,6 +130,88 @@ class LabelEmbedder(nn.Module):
         embeddings = self.embedding_table(labels)
         return embeddings
 
+### partial point clould embedding
+class PartialPcdEmbedder(nn.Module):
+        """
+        Embeds partial point cloud in sterad of class labels into vector representations. Also handles label dropout for classifier-free guidance.
+        the original point could (B, 3, 300) -> (B , , hidden_num)
+        """
+        def __init__(self, 
+                     dropout_prob,
+                     input_size=32, 
+                     hidden_size=1152,
+                     patch_size=4,
+                     in_channels=3,
+                     num_heads=16,
+                     mlp_ratio=4.0,
+                     depth=3
+                     ):
+            super().__init__()
+            self.dropout_prob = dropout_prob
+            self.input_size = input_size
+            self.patch_size = patch_size
+
+
+            self.voxelization = Voxelization(resolution=input_size, normalize=True, eps=0)
+            self.x_embedder = PatchEmbed_Voxel(input_size, patch_size, in_channels, hidden_size, bias=True)
+            num_patches = self.x_embedder.num_patches
+            self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
+
+            self.blocks = nn.ModuleList([
+                ViTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
+            ])
+            self.initialize_weights()
+
+        def initialize_weights(self):
+            # Initialize transformer layers:
+            def _basic_init(module):
+                if isinstance(module, nn.Linear):
+                    torch.nn.init.xavier_uniform_(module.weight)
+                    if module.bias is not None:
+                        nn.init.constant_(module.bias, 0)
+            self.apply(_basic_init)
+
+            # Initialize (and freeze) pos_embed by sin-cos embedding:
+            pos_embed = get_3d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.input_size//self.patch_size))
+            self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+
+            # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
+            w = self.x_embedder.proj.weight.data
+            nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
+
+        def token_drop(self, partial_pcd, force_drop_ids=None):
+            """
+            Drops partial point clouds to enable classifier-free guidance.
+            partial_pcd (B, 3, P=300)
+            """
+            if force_drop_ids is None:
+                drop_ids = torch.rand(partial_pcd.shape[0], device=partial_pcd.device) < self.dropout_prob
+            else:
+                drop_ids = force_drop_ids == 1
+            # print('token drop drop_ids:', drop_ids, drop_ids.shape)
+            zeros = torch.zeros_like(partial_pcd[0], device=partial_pcd.device)
+            partial_pcd = torch.where(drop_ids, zeros, partial_pcd)
+            return partial_pcd
+
+        def forward(self, partial_pcd, train, force_drop_ids=None):
+            use_dropout = self.dropout_prob > 0
+            if (train and use_dropout) or (force_drop_ids is not None):
+                partial_pcd = self.token_drop(partial_pcd, force_drop_ids)
+            
+            features, coords = partial_pcd, partial_pcd
+            x, voxel_coords = self.voxelization(features, coords)
+
+            x = self.x_embedder(x)
+            x = x + self.pos_embed
+
+            for block in self.blocks:
+                embeddings = block(x) # (B, patches_num, hidden_dim) 
+
+            #(B, patches_num, hidden_dim)  -> (B, hidden_dim)
+            # here choose the max pooling like in pointnet
+            embeddings, _ = torch.max(embeddings, dim=1)
+
+            return embeddings
 
 #################################################################################
 #                                 Core DiT Model                                #
@@ -130,11 +221,18 @@ class DiTBlock(nn.Module):
     """
     A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
     """
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **block_kwargs):
+    def __init__(self, 
+                 hidden_size, 
+                 num_heads, 
+                 mlp_ratio=4.0, 
+                 use_adaptformer=False,
+                 adapt_bottleneck=64,
+                 **block_kwargs):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.use_adaptformer = use_adaptformer
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         # approx_gelu = lambda: nn.GELU(approximate="tanh")
         approx_gelu = lambda: nn.GELU() # for torch 1.7.1
@@ -143,11 +241,45 @@ class DiTBlock(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
         )
+        if use_adaptformer:
+            self.adaptmlp = Adapter(d_model=hidden_size, dropout=0.1, bottleneck=adapt_bottleneck)
 
     def forward(self, x, c):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
         x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+
+        # parallel add adaptformer
+        if self.use_adaptformer:
+            adapt_x = self.adaptmlp(x, add_residual=False)
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        if self.use_adaptformer:
+            x = x + adapt_x
+
+        return x
+    
+# ViT block for partial point cloud embedding
+class ViTBlock(nn.Module):
+    """
+    Sample ViT Block
+    """
+    def __init__(self, 
+                 hidden_size, 
+                 num_heads, 
+                 mlp_ratio=4.0, 
+                 **block_kwargs):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
+        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        mlp_hidden_dim = int(hidden_size * mlp_ratio)
+        # approx_gelu = lambda: nn.GELU(approximate="tanh")
+        approx_gelu = lambda: nn.GELU() # for torch 1.7.1
+        self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
+
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+
         return x
 
 
@@ -186,7 +318,9 @@ class DiT(nn.Module):
         mlp_ratio=4.0,
         class_dropout_prob=0.1,
         num_classes=1,
-        learn_sigma=False
+        learn_sigma=False,
+        adaptformer=False,
+        partial_pcd=False
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -194,6 +328,7 @@ class DiT(nn.Module):
         self.out_channels = in_channels * 2 if learn_sigma else in_channels
         self.patch_size = patch_size
         self.num_heads = num_heads
+        self.partial_pcd = partial_pcd
 
         self.input_size = input_size
         self.voxelization = Voxelization(resolution=input_size, normalize=True, eps=0)
@@ -202,13 +337,20 @@ class DiT(nn.Module):
         num_patches = self.x_embedder.num_patches
         
         self.t_embedder = TimestepEmbedder(hidden_size)
-        self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
+
+        if partial_pcd:
+            self.partial_pcd_embedder = PartialPcdEmbedder(class_dropout_prob,
+                                                 hidden_size=hidden_size,
+                                                 patch_size=patch_size,
+                                                 in_channels=in_channels)
+        else:
+            self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
 
         # Will use fixed sin-cos embedding:
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
 
         self.blocks = nn.ModuleList([
-            DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
+            DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, use_adaptformer=adaptformer) for _ in range(depth)
         ])
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
         self.initialize_weights()
@@ -231,7 +373,8 @@ class DiT(nn.Module):
         nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
 
         # Initialize label embedding table:
-        nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
+        if self.partial_pcd is False:
+            nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
 
         # Initialize timestep embedding MLP:
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
@@ -268,27 +411,33 @@ class DiT(nn.Module):
         Forward pass of DiT.
         x: (N, C, P) tensor of spatial inputs (point clouds or latent representations of images)
         t: (N,) tensor of diffusion timesteps
-        y: (N,) tensor of class labels
+        y: (N,) tensor of class labels ( if is point cloud completion task, y is the partial point cloud of shapenet with (B, C, P=300))
         """
 
         # Voxelization
         features, coords = x, x
-        x, voxel_coords = self.voxelization(features, coords)
+        x, voxel_coords = self.voxelization(features, coords) # (B, 3, 32, 32, 32)
 
-        x = self.x_embedder(x) 
-        x = x + self.pos_embed 
+        x = self.x_embedder(x) # patchfiy: torch.Size([B, num_patches, hidden_dim])
+        x = x + self.pos_embed # torch.Size([B, num_patches, hidden_dim]) +  torch.Size([B, num_patches, hidden_dim])
 
-        t = self.t_embedder(t)  
-        y = self.y_embedder(y, self.training)    
-        c = t + y                                
+        t = self.t_embedder(t)  # t should be torch.Size([B, hidden_dim])
+
+        if self.partial_pcd:
+            y = self.partial_pcd_embedder(y, self.training)
+        else:
+            y = self.y_embedder(y, self.training)    # y - torch.Size([B, hidden_dim])
+
+
+        c = t + y # torch.Size([B, hidden_dim])                
 
         for block in self.blocks:
-            x = block(x, c)                      
-        x = self.final_layer(x, c)                
-        x = self.unpatchify_voxels(x)                   
+            x = block(x, c) 
+        x = self.final_layer(x, c)    
+        x = self.unpatchify_voxels(x)                 
 
         # Devoxelization
-        x = F.trilinear_devoxelize(x, voxel_coords, self.input_size, self.training)
+        x = trilinear_devoxelize(x, voxel_coords, self.input_size, self.training)
 
         return x
 
@@ -322,7 +471,7 @@ def get_3d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=
     return:
     pos_embed: [grid_size*grid_size, embed_dim] or [1+grid_size*grid_size, embed_dim] (w/ or w/o cls_token)
     """
-    print('grid_size:', grid_size)
+    # print('grid_size:', grid_size)
 
     grid_x = np.arange(grid_size, dtype=np.float32)
     grid_y = np.arange(grid_size, dtype=np.float32)

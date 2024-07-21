@@ -7,15 +7,16 @@ chamfer_found = importlib.find_loader("chamfer_3D") is not None
 if not chamfer_found:
     ## Cool trick from https://github.com/chrdiller
     print("Jitting Chamfer 3D")
+    cur_path = os.path.dirname(os.path.abspath(__file__))
+    build_path = cur_path.replace('chamfer3D', 'tmp')
+    os.makedirs(build_path, exist_ok=True)
 
     from torch.utils.cpp_extension import load
     chamfer_3D = load(name="chamfer_3D",
           sources=[
               "/".join(os.path.abspath(__file__).split('/')[:-1] + ["chamfer_cuda.cpp"]),
               "/".join(os.path.abspath(__file__).split('/')[:-1] + ["chamfer3D.cu"]),
-              ],
-
-                      extra_cuda_cflags=['--compiler-bindir=/usr/bin/gcc-8'],)
+              ], build_directory=build_path)
     print("Loaded JIT 3D CUDA chamfer distance")
 
 else:
@@ -28,8 +29,12 @@ else:
 class chamfer_3DFunction(Function):
     @staticmethod
     def forward(ctx, xyz1, xyz2):
-        batchsize, n, _ = xyz1.size()
-        _, m, _ = xyz2.size()
+        batchsize, n, dim = xyz1.size()
+        assert dim==3, "Wrong last dimension for the chamfer distance 's input! Check with .size()"
+        _, m, dim = xyz2.size()
+        assert dim==3, "Wrong last dimension for the chamfer distance 's input! Check with .size()"
+        device = xyz1.device
+
         device = xyz1.device
 
         dist1 = torch.zeros(batchsize, n)
@@ -74,4 +79,3 @@ class chamfer_3DDist(nn.Module):
         input1 = input1.contiguous()
         input2 = input2.contiguous()
         return chamfer_3DFunction.apply(input1, input2)
-

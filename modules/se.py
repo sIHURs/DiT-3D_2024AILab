@@ -1,16 +1,14 @@
 import torch.nn as nn
-import torch
+
 __all__ = ['SE3d']
 
-class Swish(nn.Module):
-    def forward(self,x):
-        return  x * torch.sigmoid(x)
+
 class SE3d(nn.Module):
-    def __init__(self, channel, reduction=8, use_relu=False):
+    def __init__(self, channel, reduction=8):
         super().__init__()
         self.fc = nn.Sequential(
             nn.Linear(channel, channel // reduction, bias=False),
-            nn.ReLU(True) if use_relu else Swish() ,
+            nn.ReLU(inplace=True),
             nn.Linear(channel // reduction, channel, bias=False),
             nn.Sigmoid()
         )
