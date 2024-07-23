@@ -5,7 +5,6 @@ data
 checkpoints
 output
 __pycache__
-*.png
 *.net
 *.npy
 *.npz
