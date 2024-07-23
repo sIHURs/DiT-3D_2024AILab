@@ -7,13 +7,10 @@ import click
 @click.option('--path', '-p', type=str, help='path to pcd')
 @click.option('--radius', '-r', type=float, default=0, help='range to filter pcd')
 def main(path, radius):
-    points = np.load(path)
-    print(points.shape)
+    pcd = o3d.io.read_point_cloud(path)
 
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points)
-    
     if radius > 0.:
+        points = np.array(pcd.points)
         dist = np.sum(points**2, -1)**0.5
         pcd.points = o3d.utility.Vector3dVector(points[(dist < radius) & (points[:,-1] < 3.) & (points[:,-1] > -2.5)])
 

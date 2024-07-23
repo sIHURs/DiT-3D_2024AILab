@@ -85,6 +85,7 @@ class Uniform15KPC(Dataset):
                 assert point_cloud.shape[0] == 15000
 
                 # get all the point to a list? will it cause a Cuda out of memory?
+                # in the case its still on the cpu, while we do train and inference, the data will transfered to the gpu data.to'cuda' per batchsize
                 self.all_points.append(point_cloud[np.newaxis, ...])
                 self.cate_idx_lst.append(cate_idx)
                 self.all_cate_mids.append((subd, mid))
