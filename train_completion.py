@@ -9,7 +9,8 @@ from torch.distributions import Normal
 from utils.file_utils import *
 from utils.visualize import *
 import torch.distributed as dist
-from datasets.shapenet_data_pc import ShapeNet15kPointClouds
+# from datasets.shapenet_data_pc import ShapeNet15kPointClouds
+from datasets.shapenet_data_comletion import ShapeNet15kPointCloudsPart
 
 from copy import deepcopy
 from collections import OrderedDict
@@ -345,7 +346,7 @@ class GaussianDiffusion:
             noise = torch.randn(data_start.shape, dtype=data_start.dtype, device=data_start.device)
         assert noise.shape == data_start.shape and noise.dtype == data_start.dtype
 
-        data_t = self.q_sample(x_start=data_start, t=t, noise=noise)
+        data_t = self.q_sample(x_start=data_start, t=t, noise=noise) # get noised image x_t
 
         if self.loss_type == 'mse':
             # predict the noise instead of x_start. seems to be weighted naturally like SNR
@@ -417,12 +418,16 @@ class Model(nn.Module):
                                                    input_size=args.voxel_size, 
                                                    window_size=args.window_size, 
                                                    window_block_indexes=args.window_block_indexes, 
-                                                   num_classes=args.num_classes
+                                                   num_classes=args.num_classes,
+                                                   partial_pcd=True, # condtion
+                                                   adaptformer=True
                                                 )
         else:
             self.model = DiT3D_models[args.model_type](pretrained=args.use_pretrained, 
                                                     input_size=args.voxel_size, 
-                                                    num_classes=args.num_classes
+                                                    num_classes=args.num_classes,
+                                                    partial_pcd=True, # condtion
+                                                    adaptformer=True
                                                     )
 
 
@@ -507,27 +512,31 @@ def get_betas(schedule_type, b_start, b_end, time_num):
         raise NotImplementedError(schedule_type)
     return betas
 
-
-def get_dataset(dataroot, npoints,category):
-    tr_dataset = ShapeNet15kPointClouds(root_dir=dataroot,
+def get_dataset(dataroot, npoints, npoints_part, category):
+    tr_dataset = ShapeNet15kPointCloudsPart(root_dir=dataroot,
         categories=category.split(','), split='train',
         tr_sample_size=npoints,
         te_sample_size=npoints,
+        tr_sample_part_size=npoints_part,
+        te_sample_part_size=npoints_part,
         scale=1.,
         normalize_per_shape=False,
         normalize_std_per_axis=False,
         random_subsample=True)
-    te_dataset = ShapeNet15kPointClouds(root_dir=dataroot,
-        categories=category.split(','), split='val',
-        tr_sample_size=npoints,
-        te_sample_size=npoints,
-        scale=1.,
-        normalize_per_shape=False,
-        normalize_std_per_axis=False,
-        all_points_mean=tr_dataset.all_points_mean,
-        all_points_std=tr_dataset.all_points_std,
-    )
-    return tr_dataset, te_dataset
+    
+    # test datasetwill not be used in train program
+
+    # te_dataset = ShapeNet15kPointCloudsPart(root_dir=dataroot,
+    #     categories=category.split(','), split='val',
+    #     tr_sample_size=npoints,
+    #     te_sample_size=npoints,
+    #     scale=1.,
+    #     normalize_per_shape=False,
+    #     normalize_std_per_axis=False,
+    #     all_points_mean=tr_dataset.all_points_mean,
+    #     all_points_std=tr_dataset.all_points_std,
+    # )
+    return tr_dataset, None
 
 
 def get_dataloader(opt, train_dataset, test_dataset=None):
@@ -550,7 +559,7 @@ def get_dataloader(opt, train_dataset, test_dataset=None):
         train_sampler = None
         test_sampler = None
 
-    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=opt.bs,sampler=train_sampler,
+    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=opt.bs, sampler=train_sampler,
                                                    shuffle=train_sampler is None, num_workers=int(opt.workers), drop_last=True)
 
     if test_dataset is not None:
@@ -566,6 +575,7 @@ def train(gpu, opt, output_dir, noises_init):
 
     set_seed(opt)
     logger = setup_logging(output_dir)
+    logger.info("--------------------------------------training----------------------------------------")
 
     if not opt.debug:
         if opt.use_tb:
@@ -598,7 +608,7 @@ def train(gpu, opt, output_dir, noises_init):
 
 
     ''' data '''
-    train_dataset, _ = get_dataset(opt.dataroot, opt.npoints, opt.category)
+    train_dataset, _ = get_dataset(opt.dataroot, opt.npoints, opt.npoints_part, opt.category)
     dataloader, _, train_sampler, _ = get_dataloader(opt, train_dataset, None)
 
 
@@ -642,14 +652,14 @@ def train(gpu, opt, output_dir, noises_init):
     print("Model = %s" % str(model))
     total_params = sum(param.numel() for param in model.parameters())/1e6
     print("Total_params = %s MB " % str(total_params))   
+    logger.info("Model = %s" % str(model))
+    logger.info("Total_params = %s MB " % str(total_params))
+    
 
     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
     optimizer = torch.optim.AdamW(model.parameters(), lr=opt.lr, weight_decay=0)
 
     if opt.model != '': # default as empty, set pretrained weights if continue to train
-        # ckpt = torch.load(opt.model)
-        # model.load_state_dict(ckpt['model_state'])
-        # optimizer.load_state_dict(ckpt['optimizer_state'])
         ckpt = torch.load(opt.model)
 
         # model.load_state_dict(ckpt['model_state'])
@@ -681,11 +691,24 @@ def train(gpu, opt, output_dir, noises_init):
 
         print("finished load weights")
 
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print("trainable parameters before freeze: ", trainable_params)
+
+        if opt.freeze:
+            layers_not_to_freeze = ['partial_pcd_embedder', 'adaptmlp', 'adaLN_modulation']
+            for name, param in model.named_parameters():
+                if all(layer_name not in name for layer_name in layers_not_to_freeze):
+                    param.requires_grad = False
+
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print("trainable parameters after freeze: ", trainable_params)
+
         optimizer.load_state_dict(ckpt['optimizer_state'])
         print("finished load optimizer state")
 
     if opt.model != '':
         start_epoch = torch.load(opt.model)['epoch'] + 1
+        logger.info("start epoch = %s" % str(start_epoch))
     else:
         start_epoch = 0
 
@@ -710,8 +733,7 @@ def train(gpu, opt, output_dir, noises_init):
 
             x = data['train_points'].transpose(1,2)
             noises_batch = noises_init[data['idx']].transpose(1,2)
-            y = data['cate_idx']
-
+            y = data['train_partial_points'].transpose(1,2)
             '''
             train diffusion
             '''
@@ -785,9 +807,11 @@ def train(gpu, opt, output_dir, noises_init):
 
             model.eval()
             with torch.no_grad():
-
-                x_gen_eval = model.gen_samples(new_x_chain(x, 25).shape, x.device, new_y_chain(y,25,opt.num_classes), clip_denoised=False)
-                x_gen_list = model.gen_sample_traj(new_x_chain(x, 1).shape, x.device, new_y_chain(y,1,opt.num_classes), freq=40, clip_denoised=False)
+                #
+                x_gen_eval = model.gen_samples(new_x_chain(x, opt.bs).shape, x.device, y, clip_denoised=False)
+                x_gen_list = model.gen_sample_traj(new_x_chain(x, 1).shape, x.device, y[0].unsqueeze(0), freq=40, clip_denoised=False)
+                # x_gen_eval = model.gen_samples(new_x_chain(x, 25).shape, x.device, new_y_chain(y,25,opt.num_classes), clip_denoised=False)
+                # x_gen_list = model.gen_sample_traj(new_x_chain(x, 1).shape, x.device, new_y_chain(y,1,opt.num_classes), freq=40, clip_denoised=False)
                 x_gen_all = torch.cat(x_gen_list, dim=0)
 
                 gen_stats = [x_gen_eval.mean(), x_gen_eval.std()]
@@ -811,6 +835,10 @@ def train(gpu, opt, output_dir, noises_init):
                                        None)
 
             visualize_pointcloud_batch('%s/epoch_%03d_x.png' % (outf_syn, epoch), x.transpose(1, 2), None,
+                                       None,
+                                       None)
+            
+            visualize_pointcloud_batch('%s/epoch_%03d_partial_pcd.png' % (outf_syn, epoch), y.transpose(1, 2), None,
                                        None,
                                        None)
 
@@ -850,6 +878,8 @@ def train(gpu, opt, output_dir, noises_init):
         # set use single GPU (device: gpu 0), but comes error assert pg is not None
         # dist.destroy_process_group() for mutli gpu training?
         dist.destroy_process_group() 
+    
+    tb_writer.close()
 
 def main():
     opt = parse_args()
@@ -862,8 +892,11 @@ def main():
     copy_source(__file__, output_dir)
 
     ''' workaround '''
-    train_dataset, _ = get_dataset(opt.dataroot, opt.npoints, opt.category)
-    noises_init = torch.randn(len(train_dataset), opt.npoints, opt.nc)
+    # train_dataset, _ = get_dataset(opt.dataroot, opt.npoints, opt.npoints_part, opt.category)
+    # noises_init = torch.randn(len(train_dataset), opt.npoints, opt.nc)
+
+    # only for shapenetCompletion dataset, category chair - len is 5750
+    noises_init = torch.randn(5750, opt.npoints, opt.nc)
 
     # Use random port to avoid collision between parallel jobs
     if opt.world_size == 1:
@@ -889,7 +922,7 @@ def parse_args():
     # Data params
     parser.add_argument('--dataroot', default='ShapeNetCore.v2.PC15k/')
     parser.add_argument('--category', default='chair')
-    parser.add_argument('--num_classes', type=int, default=55)
+    parser.add_argument('--num_classes', type=int, default=1)
 
     parser.add_argument('--bs', type=int, default=16, help='input batch size')
     parser.add_argument('--workers', type=int, default=8, help='workers')
@@ -897,6 +930,7 @@ def parse_args():
 
     parser.add_argument('--nc', default=3)
     parser.add_argument('--npoints', default=2048)
+    parser.add_argument('--npoints_part', default=512)
     parser.add_argument("--voxel_size", type=int, choices=[16, 32, 64, 128, 256], default=32)
     
     '''model'''
@@ -955,6 +989,8 @@ def parse_args():
     parser.add_argument('--use_tb', action='store_true', default=False, help = 'use tensorboard')
     parser.add_argument('--use_pretrained', action='store_true', default=False, help = 'use pretrained 2d DiT weights')
     parser.add_argument('--use_ema', action='store_true', default=False, help = 'use ema')
+
+    parser.add_argument('--freeze', action='store_true', default=False, help = 'freeze part of parameters for fine tuning')
 
     opt = parser.parse_args()
 

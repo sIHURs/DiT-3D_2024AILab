@@ -18,11 +18,14 @@ from utils.visualize import *
 from tqdm import tqdm
 
 from datasets.shapenet_data_pc import ShapeNet15kPointClouds
+from datasets.shapenet_data_comletion import ShapeNet15kPointCloudsPart
 from models.dit3d import DiT3D_models
 from utils.misc import Evaluator
 
 import open3d as o3d
 import numpy as np
+
+from models.dit3d_window_attn import DiT3D_models_WindAttn
 
 
 '''
@@ -212,7 +215,7 @@ class GaussianDiffusion:
         return (sample, pred_xstart) if return_pred_xstart else sample
 
 
-    def p_sample_loop(self, denoise_fn, shape, device, y,
+    def p_sample_loop(self, input_pcd, denoise_fn, shape, device, y,
                       noise_fn=torch.randn, clip_denoised=True, keep_running=False):
         """
         Generate samples
@@ -221,7 +224,8 @@ class GaussianDiffusion:
         """
 
         assert isinstance(shape, (tuple, list))
-        img_t = noise_fn(size=shape, dtype=torch.float, device=device)
+        # img_t = noise_fn(size=shape, dtype=torch.float, device=device)
+        img_t = input_pcd
         # print("img_t:", img_t.device)
         for t in reversed(range(0, self.num_timesteps if not keep_running else len(self.betas))):
             t_ = torch.empty(shape[0], dtype=torch.int64, device=device).fill_(t)
@@ -256,7 +260,15 @@ class Model(nn.Module):
         self.diffusion = GaussianDiffusion(betas, loss_type, model_mean_type, model_var_type)
         
         # DiT-3d
-        self.model = DiT3D_models[args.model_type](input_size=args.voxel_size, num_classes=args.num_classes)
+        # self.model = DiT3D_models[args.model_type](input_size=args.voxel_size, num_classes=args.num_classes)
+        self.model = DiT3D_models_WindAttn[args.model_type](
+                                                   input_size=args.voxel_size, 
+                                                   window_size=args.window_size, 
+                                                   window_block_indexes=args.window_block_indexes, 
+                                                   num_classes=args.num_classes,
+                                                   partial_pcd=True, # condtion
+                                                   adaptformer=True
+                                                )
 
     def prior_kl(self, x0):
         return self.diffusion._prior_bpd(x0)
@@ -294,10 +306,10 @@ class Model(nn.Module):
         assert losses.shape == t.shape == torch.Size([B])
         return losses
 
-    def gen_samples(self, shape, device, y, noise_fn=torch.randn,
+    def gen_samples(self, input_pcd, shape, device, y, noise_fn=torch.randn,
                     clip_denoised=True,
                     keep_running=False):
-        return self.diffusion.p_sample_loop(self._denoise, shape=shape, device=device, y=y, noise_fn=noise_fn,
+        return self.diffusion.p_sample_loop(input_pcd, self._denoise, shape=shape, device=device, y=y, noise_fn=noise_fn,
                                             clip_denoised=clip_denoised,
                                             keep_running=keep_running)
 
@@ -375,27 +387,31 @@ def concat_all_gather(tensor):
 
 #############################################################################
 
-def get_dataset(dataroot, npoints,category,use_mask=False):
-    tr_dataset = ShapeNet15kPointClouds(root_dir=dataroot,
-        categories=[category], split='train',
+def get_dataset(dataroot, npoints, npoints_part, category):
+    tr_dataset = ShapeNet15kPointCloudsPart(root_dir=dataroot,
+        categories=category.split(','), split='train',
         tr_sample_size=npoints,
         te_sample_size=npoints,
+        tr_sample_part_size=npoints_part,
+        te_sample_part_size=npoints_part,
         scale=1.,
         normalize_per_shape=False,
         normalize_std_per_axis=False,
-        random_subsample=True, use_mask = use_mask)
-    te_dataset = ShapeNet15kPointClouds(root_dir=dataroot,
-        categories=[category], split='val',
-        tr_sample_size=npoints,
-        te_sample_size=npoints,
-        scale=1.,
-        normalize_per_shape=False,
-        normalize_std_per_axis=False,
-        all_points_mean=tr_dataset.all_points_mean,
-        all_points_std=tr_dataset.all_points_std,
-        use_mask=use_mask
-    )
-    return tr_dataset, te_dataset
+        random_subsample=True)
+    
+    # test datasetwill not be used in train program
+
+    # te_dataset = ShapeNet15kPointCloudsPart(root_dir=dataroot,
+    #     categories=category.split(','), split='val',
+    #     tr_sample_size=npoints,
+    #     te_sample_size=npoints,
+    #     scale=1.,
+    #     normalize_per_shape=False,
+    #     normalize_std_per_axis=False,
+    #     all_points_mean=tr_dataset.all_points_mean,
+    #     all_points_std=tr_dataset.all_points_std,
+    # )
+    return tr_dataset, None
 
 
 def get_dataloader(opt, train_dataset, test_dataset=None):
@@ -418,7 +434,7 @@ def get_dataloader(opt, train_dataset, test_dataset=None):
         train_sampler = None
         test_sampler = None
 
-    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=opt.bs,sampler=train_sampler,
+    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=opt.bs, sampler=train_sampler,
                                                    shuffle=train_sampler is None, num_workers=int(opt.workers), drop_last=True)
 
     if test_dataset is not None:
@@ -485,16 +501,19 @@ def pipeline(model, opt, gpu):
     def new_y_chain(device, num_chain, num_classes):
         return torch.randint(low=0,high=num_classes,size=(num_chain,),device=device)
     
-    _, test_dataset = get_dataset(opt.dataroot, opt.npoints, opt.category)
-    _, test_dataloader, _, test_sampler = get_dataloader(opt, test_dataset, test_dataset)
-
-    #get a example from dataloader
-    data = next(iter(test_dataloader))
+    train_dataset, _ = get_dataset(opt.dataroot, opt.npoints, opt.npoints_part, opt.category)
+    dataloader, _, train_sampler, _ = get_dataloader(opt, train_dataset, None)
+    
+    # get a example from dataloader
+    data = next(iter(dataloader))
     x = data['test_points'].transpose(1,2)
     m, s = data['mean'].float(), data['std'].float()
-    y = data['cate_idx']
+    y = data['train_partial_points'].transpose(1,2)
 
-    gen = model.gen_samples(x.shape, gpu, new_y_chain(gpu,y.shape[0],opt.num_classes), clip_denoised=False).detach().cpu()
+    y_t = y.repeat(1, 1, 4)
+    y_t = y + torch.randn_like(y_t)
+
+    gen = model.gen_samples(y_t, x.shape, gpu, y, clip_denoised=False).detach().cpu()
 
     gen = gen.transpose(1,2).contiguous()
     x = x.transpose(1,2).contiguous()
@@ -507,8 +526,11 @@ def pipeline(model, opt, gpu):
     #remove batch dim
     gen = gen.numpy()
     x = x.numpy()
+    y = y.numpy()
     gen = np.squeeze(gen)
     x = np.squeeze(x)
+    y = y.squeeze(y)
+
 
     gen_pcd = o3d.geometry.PointCloud()
     gen_pcd.points = o3d.utility.Vector3dVector(gen)
@@ -516,16 +538,14 @@ def pipeline(model, opt, gpu):
     gt_pcd = o3d.geometry.PointCloud()
     gt_pcd.points = o3d.utility.Vector3dVector(x)
 
-    o3d.io.write_point_cloud("/home/yifan/studium/3D_Completion/DiT-3D_2024AILab/checkpoints/shortOutput/gen_pcd.ply", gen_pcd)
-    o3d.io.write_point_cloud("/home/yifan/studium/3D_Completion/DiT-3D_2024AILab/checkpoints/shortOutput/gt_pcd.ply", gt_pcd)
+    cond_pcd = o3d.geometry.PointCloud()
+    gen_pcd.points = o3d.utility.Vector3dVector(y)
 
+    o3d.io.write_point_cloud("/home/yifan/studium/3D_Completion/DiT-3D_2024AILab/checkpoints/pipeline/gen_pcd.ply", gen_pcd)
+    o3d.io.write_point_cloud("/home/yifan/studium/3D_Completion/DiT-3D_2024AILab/checkpoints/pipeline/gt_pcd.ply", gt_pcd)
+    o3d.io.write_point_cloud("/home/yifan/studium/3D_Completion/DiT-3D_2024AILab/checkpoints/pipeline/cond_pcd.ply", cond_pcd)
                 
 def main(opt):
-
-    if opt.category == 'airplane':
-        opt.beta_start = 1e-5
-        opt.beta_end = 0.008
-        opt.schedule_type = 'warm0.1'
 
     output_dir = get_output_dir(opt.model_dir, opt.experiment_name)
     copy_source(__file__, output_dir)
@@ -544,7 +564,6 @@ def main(opt):
 def test(gpu, opt, output_dir):
 
     logger = setup_logging(output_dir)
-
 
     if opt.distribution_type == 'multi':
         should_diag = gpu==0
@@ -628,7 +647,7 @@ def parse_args():
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_dir', type=str, default='./checkpoints', help='path to save trained model weights')
-    parser.add_argument('--experiment_name', type=str, default='shortOutput', help='experiment name (used for checkpointing and logging)')
+    parser.add_argument('--experiment_name', type=str, default='pipeline_car', help='experiment name (used for checkpointing and logging)')
 
     parser.add_argument('--dataroot', default='ShapeNetCore.v2.PC15k/')
     parser.add_argument('--category', default='chair')

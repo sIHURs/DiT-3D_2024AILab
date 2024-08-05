@@ -7,7 +7,9 @@ output
 __pycache__
 *.net
 *.npy
+*.pcd
 *.npz
+*.log
 eval_model
 eval_data
 

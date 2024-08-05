@@ -584,7 +584,7 @@ def parse_args():
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_dir', type=str, default='./checkpoints', help='path to save trained model weights')
-    parser.add_argument('--experiment_name', type=str, default='shortOutput', help='experiment name (used for checkpointing and logging)')
+    parser.add_argument('--experiment_name', type=str, default='', help='experiment name (used for checkpointing and logging)')
 
     parser.add_argument('--dataroot', default='ShapeNetCore.v2.PC15k/')
     parser.add_argument('--category', default='chair')

@@ -132,86 +132,86 @@ class LabelEmbedder(nn.Module):
 
 ### partial point clould embedding
 class PartialPcdEmbedder(nn.Module):
+    """
+    Embeds partial point cloud in sterad of class labels into vector representations. Also handles label dropout for classifier-free guidance.
+    the original point could (B, 3, 300) -> (B , , hidden_num)
+    """
+    def __init__(self, 
+                    dropout_prob,
+                    input_size=32, 
+                    hidden_size=1152,
+                    patch_size=4,
+                    in_channels=3,
+                    num_heads=16,
+                    mlp_ratio=4.0,
+                    depth=3
+                    ):
+        super().__init__()
+        self.dropout_prob = dropout_prob
+        self.input_size = input_size
+        self.patch_size = patch_size
+
+
+        self.voxelization = Voxelization(resolution=input_size, normalize=True, eps=0)
+        self.x_embedder = PatchEmbed_Voxel(input_size, patch_size, in_channels, hidden_size, bias=True)
+        num_patches = self.x_embedder.num_patches
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
+
+        self.blocks = nn.ModuleList([
+            ViTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
+        ])
+        self.initialize_weights()
+
+    def initialize_weights(self):
+        # Initialize transformer layers:
+        def _basic_init(module):
+            if isinstance(module, nn.Linear):
+                torch.nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+        self.apply(_basic_init)
+
+        # Initialize (and freeze) pos_embed by sin-cos embedding:
+        pos_embed = get_3d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.input_size//self.patch_size))
+        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+
+        # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
+        w = self.x_embedder.proj.weight.data
+        nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
+
+    def token_drop(self, partial_pcd, force_drop_ids=None):
         """
-        Embeds partial point cloud in sterad of class labels into vector representations. Also handles label dropout for classifier-free guidance.
-        the original point could (B, 3, 300) -> (B , , hidden_num)
+        Drops partial point clouds to enable classifier-free guidance.
+        partial_pcd (B, 3, P=300)
         """
-        def __init__(self, 
-                     dropout_prob,
-                     input_size=32, 
-                     hidden_size=1152,
-                     patch_size=4,
-                     in_channels=3,
-                     num_heads=16,
-                     mlp_ratio=4.0,
-                     depth=3
-                     ):
-            super().__init__()
-            self.dropout_prob = dropout_prob
-            self.input_size = input_size
-            self.patch_size = patch_size
+        if force_drop_ids is None:
+            drop_ids = torch.rand(partial_pcd.shape[0], device=partial_pcd.device) < self.dropout_prob
+        else:
+            drop_ids = force_drop_ids == 1
+        # print('token drop drop_ids:', drop_ids, drop_ids.shape)
+        zeros = torch.zeros_like(partial_pcd[0], device=partial_pcd.device)
+        partial_pcd = torch.where(drop_ids, zeros, partial_pcd)
+        return partial_pcd
 
+    def forward(self, partial_pcd, train, force_drop_ids=None):
+        use_dropout = self.dropout_prob > 0
+        if (train and use_dropout) or (force_drop_ids is not None):
+            partial_pcd = self.token_drop(partial_pcd, force_drop_ids)
+        
+        features, coords = partial_pcd, partial_pcd
+        x, voxel_coords = self.voxelization(features, coords)
 
-            self.voxelization = Voxelization(resolution=input_size, normalize=True, eps=0)
-            self.x_embedder = PatchEmbed_Voxel(input_size, patch_size, in_channels, hidden_size, bias=True)
-            num_patches = self.x_embedder.num_patches
-            self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
+        x = self.x_embedder(x)
+        x = x + self.pos_embed
 
-            self.blocks = nn.ModuleList([
-                ViTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
-            ])
-            self.initialize_weights()
+        for block in self.blocks:
+            embeddings = block(x) # (B, patches_num, hidden_dim) 
 
-        def initialize_weights(self):
-            # Initialize transformer layers:
-            def _basic_init(module):
-                if isinstance(module, nn.Linear):
-                    torch.nn.init.xavier_uniform_(module.weight)
-                    if module.bias is not None:
-                        nn.init.constant_(module.bias, 0)
-            self.apply(_basic_init)
+        #(B, patches_num, hidden_dim)  -> (B, hidden_dim)
+        # here choose the max pooling like in pointnet
+        embeddings, _ = torch.max(embeddings, dim=1)
 
-            # Initialize (and freeze) pos_embed by sin-cos embedding:
-            pos_embed = get_3d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.input_size//self.patch_size))
-            self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
-
-            # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
-            w = self.x_embedder.proj.weight.data
-            nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
-
-        def token_drop(self, partial_pcd, force_drop_ids=None):
-            """
-            Drops partial point clouds to enable classifier-free guidance.
-            partial_pcd (B, 3, P=300)
-            """
-            if force_drop_ids is None:
-                drop_ids = torch.rand(partial_pcd.shape[0], device=partial_pcd.device) < self.dropout_prob
-            else:
-                drop_ids = force_drop_ids == 1
-            # print('token drop drop_ids:', drop_ids, drop_ids.shape)
-            zeros = torch.zeros_like(partial_pcd[0], device=partial_pcd.device)
-            partial_pcd = torch.where(drop_ids, zeros, partial_pcd)
-            return partial_pcd
-
-        def forward(self, partial_pcd, train, force_drop_ids=None):
-            use_dropout = self.dropout_prob > 0
-            if (train and use_dropout) or (force_drop_ids is not None):
-                partial_pcd = self.token_drop(partial_pcd, force_drop_ids)
-            
-            features, coords = partial_pcd, partial_pcd
-            x, voxel_coords = self.voxelization(features, coords)
-
-            x = self.x_embedder(x)
-            x = x + self.pos_embed
-
-            for block in self.blocks:
-                embeddings = block(x) # (B, patches_num, hidden_dim) 
-
-            #(B, patches_num, hidden_dim)  -> (B, hidden_dim)
-            # here choose the max pooling like in pointnet
-            embeddings, _ = torch.max(embeddings, dim=1)
-
-            return embeddings
+        return embeddings
 
 #################################################################################
 #                                 Core DiT Model                                #

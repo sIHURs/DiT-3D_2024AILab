@@ -17,6 +17,7 @@ import numpy as np
 import math
 from timm.models.layers import to_2tuple
 from timm.models.vision_transformer import PatchEmbed, Mlp
+from timm.models.vision_transformer import Attention as timm_attention
 
 # from modules.voxelization import Voxelization
 # import modules.functional as F
@@ -187,6 +188,99 @@ class LabelEmbedder(nn.Module):
         embeddings = self.embedding_table(labels)
         return embeddings
 
+### partial point clould embedding
+class PartialPcdEmbedder(nn.Module):
+    """
+    Embeds partial point cloud in sterad of class labels into vector representations. Also handles label dropout for classifier-free guidance.
+    the original point could (B, 3, 512) -> (B , , hidden_num)
+    """
+    def __init__(self, 
+                    dropout_prob,
+                    input_size=32, 
+                    hidden_size=1152,
+                    patch_size=4,
+                    in_channels=3,
+                    num_heads=16,
+                    mlp_ratio=4.0,
+                    depth=3
+                    ):
+        super().__init__()
+        self.dropout_prob = dropout_prob
+        self.input_size = input_size
+        self.patch_size = patch_size
+
+
+        self.voxelization = Voxelization(resolution=input_size, normalize=True, eps=0)
+        self.x_embedder = PatchEmbed_Voxel(input_size, patch_size, in_channels, hidden_size, bias=True)
+        num_patches = self.x_embedder.num_patches
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
+
+        self.blocks = nn.ModuleList([
+            ViTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
+        ])
+        self.initialize_weights()
+
+    def initialize_weights(self):
+        # Initialize transformer layers:
+        def _basic_init(module):
+            if isinstance(module, nn.Linear):
+                torch.nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+        self.apply(_basic_init)
+
+        # Initialize (and freeze) pos_embed by sin-cos embedding:
+        pos_embed = get_3d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.input_size//self.patch_size))
+        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+
+        # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
+        w = self.x_embedder.proj.weight.data
+        nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
+
+    def token_drop(self, partial_pcd, force_drop_ids=None):
+        """
+        Drops partial point clouds to enable classifier-free guidance.
+        partial_pcd (B, 3, 512)
+        """
+        if force_drop_ids is None:
+            drop_ids = torch.rand(partial_pcd.shape[0], device=partial_pcd.device) < self.dropout_prob
+        else:
+            drop_ids = force_drop_ids == 1
+        # print('token drop drop_ids:', drop_ids, drop_ids.shape)
+        zeros = torch.zeros_like(partial_pcd, device=partial_pcd.device)
+
+        drop_ids_tensor = torch.full(partial_pcd.shape, True, dtype=torch.bool, device=partial_pcd.device)
+
+        for i, drop_id in enumerate(drop_ids):
+            if drop_id:
+                drop_ids_tensor[i] = torch.full((3, 512), True, dtype=torch.bool)
+            else:
+                drop_ids_tensor[i] = torch.full((3, 512), False, dtype=torch.bool)
+        assert drop_ids_tensor.shape == partial_pcd.shape
+        assert drop_ids_tensor.shape == zeros.shape
+
+        partial_pcd = torch.where(drop_ids_tensor, zeros, partial_pcd)
+        return partial_pcd
+
+    def forward(self, partial_pcd, train, force_drop_ids=None):
+        use_dropout = self.dropout_prob > 0
+        if (train and use_dropout) or (force_drop_ids is not None):
+            partial_pcd = self.token_drop(partial_pcd, force_drop_ids)
+        
+        features, coords = partial_pcd, partial_pcd
+        x, voxel_coords = self.voxelization(features, coords)
+
+        x = self.x_embedder(x)
+        x = x + self.pos_embed
+
+        for block in self.blocks:
+            embeddings = block(x) # (B, patches_num, hidden_dim) 
+
+        #(B, patches_num, hidden_dim)  -> (B, hidden_dim)
+        # here choose the max pooling like in pointnet
+        embeddings, _ = torch.max(embeddings, dim=1)
+
+        return embeddings
 
 #################################################################################
 #                                 Core DiT Model                                #
@@ -203,7 +297,7 @@ class DiTBlock(nn.Module):
                  rel_pos_zero_init=True,
                  window_size=0,
                  use_residual_block=False,
-                 input_size=None, 
+                 input_size=None,  #(8, 8, 8)
                  use_adaptformer=False,
                  adapt_bottleneck=64,
                  **block_kwargs):
@@ -222,6 +316,8 @@ class DiTBlock(nn.Module):
         
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
+        self.use_adaptformer = use_adaptformer
+
         # approx_gelu = lambda: nn.GELU(approximate="tanh")
         approx_gelu = lambda: nn.GELU() # for torch 1.7.1
         self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
@@ -233,40 +329,81 @@ class DiTBlock(nn.Module):
         self.window_size = window_size
 
         if use_adaptformer:
-            self.adaptmlp = Adapter(dropout=0.1, bottleneck=adapt_bottleneck)
+            self.adaptmlp = Adapter(d_model=hidden_size,
+                                    dropout=0.1, 
+                                    bottleneck=adapt_bottleneck)
 
     def forward(self, x, c):
+        # print("x into DiTBlock:", x.shape) # (B, 512, 384)
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
                 
         shortcut = x
         x = self.norm1(x)
-        B = x.shape[0]
-        x = x.reshape(B, self.input_size[0], self.input_size[1], self.input_size[2], -1)
+        B = x.shape[0] # ( batch size)
+        x = x.reshape(B, self.input_size[0], self.input_size[1], self.input_size[2], -1) #(8, 8, 8)
+        # print("x after first reshape:", x.shape) # (3, 8, 8, 8, 384)
+
         
         # Window partition
         if self.window_size > 0:
-            X, Y, Z = x.shape[1], x.shape[2], x.shape[3]
+            X, Y, Z = x.shape[1], x.shape[2], x.shape[3] #
             x, pad_xyz = window_partition(x, self.window_size)
+        # print("x after window partition: ", x.shape) # [24, 4, 4, 4, 384]
 
         x = x.reshape(B, self.input_size[0] * self.input_size[1] * self.input_size[2], -1)
+        # print("x after second reshape:", x.shape) # [3, 512, 384]
         x = modulate(x, shift_msa, scale_msa)
         x = x.reshape(B, self.input_size[0], self.input_size[1], self.input_size[2], -1)
-
+        # print("x after third reshape:", x.shape) # [3, 8, 8, 8, 384]
         x = self.attn(x)
+
+        # print("x after attention: ", x.shape) # [3, 8, 8, 8, 384]
+        # print("window size: ", self.window_size) # 4
+        # print("pad_xyz: ", pad_xyz) # 8 8 8
+
         
         # Reverse window partition
         if self.window_size > 0:
             x = window_unpartition(x, self.window_size, pad_xyz, (X, Y, Z))
         x = x.reshape(B, self.input_size[0] * self.input_size[1] * self.input_size[2], -1)
-
+        
         x = shortcut + gate_msa.unsqueeze(1) * x
-
+        # print("x shape before adapter: ", x.shape) # 8 8 8
         # parallel add adaptformer
-        adapt_x = self.adaptmlp(x, add_residual=False)
+        if self.use_adaptformer:
+            adapt_x = self.adaptmlp(x, add_residual=False)
+
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
-        x = x + adapt_x
+        if self.use_adaptformer:
+            x = x + adapt_x
 
         return x
+    
+# ViT block for partial point cloud embedding
+class ViTBlock(nn.Module):
+    """
+    Sample ViT Block
+    """
+    def __init__(self, 
+                 hidden_size, 
+                 num_heads, 
+                 mlp_ratio=4.0, 
+                 **block_kwargs):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.attn = timm_attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
+        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        mlp_hidden_dim = int(hidden_size * mlp_ratio)
+        # approx_gelu = lambda: nn.GELU(approximate="tanh")
+        approx_gelu = lambda: nn.GELU() # for torch 1.7.1
+        self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
+
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+
+        return x
+
 
 
 class FinalLayer(nn.Module):
@@ -309,7 +446,8 @@ class DiT(nn.Module):
         window_block_indexes=(),
         use_rel_pos=False,
         rel_pos_zero_init=True,
-        adaptformer=False
+        adaptformer=False,
+        partial_pcd=False
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -317,6 +455,7 @@ class DiT(nn.Module):
         self.out_channels = in_channels * 2 if learn_sigma else in_channels
         self.patch_size = patch_size
         self.num_heads = num_heads
+        self.partial_pcd = partial_pcd
 
         self.input_size = input_size
         self.voxelization = Voxelization(resolution=input_size, normalize=True, eps=0)
@@ -325,7 +464,14 @@ class DiT(nn.Module):
         num_patches = self.x_embedder.num_patches
         
         self.t_embedder = TimestepEmbedder(hidden_size)
-        self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
+
+        if partial_pcd:
+            self.partial_pcd_embedder = PartialPcdEmbedder(class_dropout_prob,
+                                                 hidden_size=hidden_size,
+                                                 patch_size=patch_size,
+                                                 in_channels=in_channels)
+        else:
+            self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
 
         # Will use fixed sin-cos embedding:
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
@@ -362,7 +508,8 @@ class DiT(nn.Module):
         nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
 
         # Initialize label embedding table:
-        nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
+        if self.partial_pcd is False:
+            nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
 
         # Initialize timestep embedding MLP:
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
@@ -409,12 +556,19 @@ class DiT(nn.Module):
         x = self.x_embedder(x) 
         x = x + self.pos_embed
 
-        t = self.t_embedder(t)                  
-        y = self.y_embedder(y, self.training)    
+        t = self.t_embedder(t)              
+
+        if self.partial_pcd:
+            y = self.partial_pcd_embedder(y, self.training)
+        else:
+            y = self.y_embedder(y, self.training)    # y - torch.Size([B, hidden_dim])
+        
         c = t + y                           
 
         for block in self.blocks:
-            x = block(x, c)                      
+            x = block(x, c)                     
+
+        # print("x shape after block: ", x.shape) 
         x = self.final_layer(x, c)
         x = self.unpatchify_voxels(x)           
 
