@@ -1,5 +1,6 @@
-python pipeline/pipeline.py --dataroot datasets/data/ShapeNetCompletion/ \
+python validation.py --dataroot datasets/data/ShapeNetCompletion/ \
     --category chair --num_classes 1 \
+    --experiment_name validation_epoch_8049 \
     --bs 16 \
     --model_type 'DiT-S/4' \
     --voxel_size 32 \

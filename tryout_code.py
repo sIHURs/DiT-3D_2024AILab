@@ -2,69 +2,44 @@ import numpy as np
 import torch
 import os
 
-# from tqdm import tqdm
-# import open3d as o3d
+from tqdm import tqdm
+import open3d as o3d
+
+import open3d as o3d
+
+# # 读取 PLY 文件
+# pcd = o3d.io.read_point_cloud("checkpoints/shortOutput/gen_pcd_chair.ply")
+
+# # 打印点云信息
+# print(pcd)
+
+# # 可视化点云
+# o3d.visualization.draw_geometries([pcd])
 
 
-# subd = '03001627'
+# 创建第一个点云
+# points1 = np.load("datasets/data/ShapeNetCompletion/val/complete/03001627/1f8e18d42ddded6a4b3c42e318f3affc.npy")
+# pcd1 = o3d.geometry.PointCloud()
+# pcd1.points = o3d.utility.Vector3dVector(points1)
 
-# # NOTE: [subd] here is synset id
-# # sub_path = os.path.join(root_dir, subd, self.split)
+pcd1 = o3d.io.read_point_cloud("checkpoints/shortOutput/gen_pcd_chair.ply")
 
-# root_dir = "/home/yifan/studium/dataset/ShapeNetCompletion"
-# split = "train"
-# sub_path_complete = os.path.join(root_dir, split, 'complete', subd)
-# sub_path_part = os.path.join(root_dir, split, 'partial', subd)
+pcd1.paint_uniform_color([0.5, 0.5, 0.5])  # 将第一个点云设为红色
 
-# if not os.path.isdir(sub_path_complete) and not os.path.isdir(sub_path_part):
-#     print("Directory missing : %s" % sub_path_complete)
-#     print("or directory missing : %s" % sub_path_part)
-#     raise NotImplementedError
+# 创建第二个点云
+# points2 = np.load("datasets/data/ShapeNetCompletion/val/partial/03001627/1f8e18d42ddded6a4b3c42e318f3affc/00.npy")
+# pcd2 = o3d.geometry.PointCloud()
+# pcd2.points = o3d.utility.Vector3dVector(points2)
+pcd2 = o3d.io.read_point_cloud("checkpoints/shortOutput/part_pcd_chair.ply")
+pcd2.paint_uniform_color([1, 0, 0])  # 将第二个点云设为绿色
 
-# all_mids = []
+# 将两个点云加入到一个列表中
+pcd_list = [pcd1, pcd2]
 
-# for x in os.listdir(sub_path_complete):
-#     if not x.endswith('.npy'):
-#         continue
-#     all_mids.append(x[:-len('.npy')]) # object file name
-# print("all_mids: ", len(all_mids))
-    
-# # get complete point cloud
-# # NOTE: [mid] contains the split: i.e. "train/<mid>" or "val/<mid>" or "test/<mid>"
-# for mid in tqdm(all_mids, desc="processing"):
-#     # add complete points cloud
-#     # obj_fname = os.path.join(root_dir, split, 'complete', subd, mid + ".pcd")
-#     # obj_save_fname = os.path.join(root_dir, split, 'complete', subd, mid + ".npy")
-#     # try:
+# 可视化两个点云
+o3d.visualization.draw_geometries(pcd_list)
 
-#     #     pcd_o3d = o3d.io.read_point_cloud(obj_fname)
-#     #     point_cloud = np.asarray(pcd_o3d.points)
-#     #     # point_cloud = np.load(obj_fname)
-#     # except:
-#     #     # print("load1 failed")
-#     #     continue
-#     # assert point_cloud.shape[0] == 16384
 
-#     # # save complete pcd
-#     # np.save(obj_save_fname, point_cloud)
-#     # os.remove(obj_fname)
-
-#     # add partial points cloud
-#     part_obj_file = os.path.join(root_dir, split, 'partial', subd, mid)
-
-#     for part_obj in ['00', '01', '02', '03', '04', '05', '06', '07']: # ['00', '01', '02', '03', '04', '05', '06', '07'] cuz limit of RAM
-#         part_obj_fname = os.path.join(part_obj_file, part_obj + ".pcd")
-#         part_obj_fname_save = os.path.join(part_obj_file, part_obj + ".npy")
-#         try:
-#             # part_point_cloud = np.load(part_obj_fname)
-#             part_pcd_o3d = o3d.io.read_point_cloud(part_obj_fname)
-
-#             point_cloud_part = np.asarray(part_pcd_o3d.points)
-#         except:
-#             # print("load2 failed")
-#             continue
-#         np.save(part_obj_fname_save, point_cloud_part)
-#         os.remove(part_obj_fname)
 
 
 
@@ -83,7 +58,3 @@ import os
 #     return labels
 
 
-partial_pcd_path = "datasets/data/ShapeNetCompletion/train/partial/03001627/1a38407b3036795d19fb4103277a6b93/00.npy"
-
-input_pcd = np.load(partial_pcd_path)
-print(input_pcd.shape)

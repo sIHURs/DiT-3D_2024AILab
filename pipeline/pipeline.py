@@ -1,64 +1,56 @@
 import os
-import torch
+import sys
+sys.path.append("/home/yifan/studium/3D_Completion/DiT-3D_2024AILab")
 
-from pprint import pprint
-from metrics.evaluation_metrics import jsd_between_point_cloud_sets as JSD
-from metrics.evaluation_metrics import compute_all_metrics, EMD_CD
+import torch
 
 import torch.nn as nn
 import torch.utils.data
-import torch.multiprocessing as mp
-import torch.distributed as dist
 
 import argparse
-from torch.distributions import Normal
 
 from utils.file_utils import *
 from utils.visualize import *
 from tqdm import tqdm
 
-from datasets.shapenet_data_pc import ShapeNet15kPointClouds
-from datasets.shapenet_data_comletion import ShapeNet15kPointCloudsPart
 from models.dit3d import DiT3D_models
-from utils.misc import Evaluator
+from models.dit3d_window_attn import DiT3D_models_WindAttn
 
 import open3d as o3d
 import numpy as np
-
-from models.dit3d_window_attn import DiT3D_models_WindAttn
 
 
 '''
 models
 '''
-def normal_kl(mean1, logvar1, mean2, logvar2):
-    """
-    KL divergence between normal distributions parameterized by mean and log-variance.
-    """
-    return 0.5 * (-1.0 + logvar2 - logvar1 + torch.exp(logvar1 - logvar2)
-                + (mean1 - mean2)**2 * torch.exp(-logvar2))
+# def normal_kl(mean1, logvar1, mean2, logvar2):
+#     """
+#     KL divergence between normal distributions parameterized by mean and log-variance.
+#     """
+#     return 0.5 * (-1.0 + logvar2 - logvar1 + torch.exp(logvar1 - logvar2)
+#                 + (mean1 - mean2)**2 * torch.exp(-logvar2))
 
-def discretized_gaussian_log_likelihood(x, *, means, log_scales): # X
-    # Assumes data is integers [0, 1]
-    assert x.shape == means.shape == log_scales.shape
-    px0 = Normal(torch.zeros_like(means), torch.ones_like(log_scales))
+# def discretized_gaussian_log_likelihood(x, *, means, log_scales): # X
+#     # Assumes data is integers [0, 1]
+#     assert x.shape == means.shape == log_scales.shape
+#     px0 = Normal(torch.zeros_like(means), torch.ones_like(log_scales))
 
-    centered_x = x - means
-    inv_stdv = torch.exp(-log_scales)
-    plus_in = inv_stdv * (centered_x + 0.5)
-    cdf_plus = px0.cdf(plus_in)
-    min_in = inv_stdv * (centered_x - .5)
-    cdf_min = px0.cdf(min_in)
-    log_cdf_plus = torch.log(torch.max(cdf_plus, torch.ones_like(cdf_plus)*1e-12))
-    log_one_minus_cdf_min = torch.log(torch.max(1. - cdf_min,  torch.ones_like(cdf_min)*1e-12))
-    cdf_delta = cdf_plus - cdf_min
+#     centered_x = x - means
+#     inv_stdv = torch.exp(-log_scales)
+#     plus_in = inv_stdv * (centered_x + 0.5)
+#     cdf_plus = px0.cdf(plus_in)
+#     min_in = inv_stdv * (centered_x - .5)
+#     cdf_min = px0.cdf(min_in)
+#     log_cdf_plus = torch.log(torch.max(cdf_plus, torch.ones_like(cdf_plus)*1e-12))
+#     log_one_minus_cdf_min = torch.log(torch.max(1. - cdf_min,  torch.ones_like(cdf_min)*1e-12))
+#     cdf_delta = cdf_plus - cdf_min
 
-    log_probs = torch.where(
-    x < 0.001, log_cdf_plus,
-    torch.where(x > 0.999, log_one_minus_cdf_min,
-             torch.log(torch.max(cdf_delta, torch.ones_like(cdf_delta)*1e-12))))
-    assert log_probs.shape == x.shape
-    return log_probs
+#     log_probs = torch.where(
+#     x < 0.001, log_cdf_plus,
+#     torch.where(x > 0.999, log_one_minus_cdf_min,
+#              torch.log(torch.max(cdf_delta, torch.ones_like(cdf_delta)*1e-12))))
+#     assert log_probs.shape == x.shape
+#     return log_probs
 
 
 class GaussianDiffusion:
@@ -215,7 +207,7 @@ class GaussianDiffusion:
         return (sample, pred_xstart) if return_pred_xstart else sample
 
 
-    def p_sample_loop(self, input_pcd, denoise_fn, shape, device, y,
+    def p_sample_loop(self, denoise_fn, shape, device, y,
                       noise_fn=torch.randn, clip_denoised=True, keep_running=False):
         """
         Generate samples
@@ -224,8 +216,7 @@ class GaussianDiffusion:
         """
 
         assert isinstance(shape, (tuple, list))
-        # img_t = noise_fn(size=shape, dtype=torch.float, device=device)
-        img_t = input_pcd
+        img_t = noise_fn(size=shape, dtype=torch.float, device=device)
         # print("img_t:", img_t.device)
         for t in reversed(range(0, self.num_timesteps if not keep_running else len(self.betas))):
             t_ = torch.empty(shape[0], dtype=torch.int64, device=device).fill_(t)
@@ -261,14 +252,15 @@ class Model(nn.Module):
         
         # DiT-3d
         # self.model = DiT3D_models[args.model_type](input_size=args.voxel_size, num_classes=args.num_classes)
+        # if args.window_size > 0:
         self.model = DiT3D_models_WindAttn[args.model_type](
-                                                   input_size=args.voxel_size, 
-                                                   window_size=args.window_size, 
-                                                   window_block_indexes=args.window_block_indexes, 
-                                                   num_classes=args.num_classes,
-                                                   partial_pcd=True, # condtion
-                                                   adaptformer=True
-                                                )
+                                                input_size=32, 
+                                                window_size=4, 
+                                                window_block_indexes=args.window_block_indexes, 
+                                                num_classes=1,
+                                                partial_pcd=True, # condtion
+                                                adaptformer=True
+                                            )
 
     def prior_kl(self, x0):
         return self.diffusion._prior_bpd(x0)
@@ -306,10 +298,10 @@ class Model(nn.Module):
         assert losses.shape == t.shape == torch.Size([B])
         return losses
 
-    def gen_samples(self, input_pcd, shape, device, y, noise_fn=torch.randn,
+    def gen_samples(self, shape, device, y, noise_fn=torch.randn,
                     clip_denoised=True,
                     keep_running=False):
-        return self.diffusion.p_sample_loop(input_pcd, self._denoise, shape=shape, device=device, y=y, noise_fn=noise_fn,
+        return self.diffusion.p_sample_loop(self._denoise, shape=shape, device=device, y=y, noise_fn=noise_fn,
                                             clip_denoised=clip_denoised,
                                             keep_running=keep_running)
 
@@ -351,22 +343,22 @@ def get_betas(schedule_type, b_start, b_end, time_num):
         raise NotImplementedError(schedule_type)
     return betas
 
-def get_constrain_function(ground_truth, mask, eps, num_steps=1):
-    '''
+# def get_constrain_function(ground_truth, mask, eps, num_steps=1):
+#     '''
 
-    :param target_shape_constraint: target voxels
-    :return: constrained x
-    '''
-    # eps_all = list(reversed(np.linspace(0,np.float_power(eps, 1/2), 500)**2))
-    eps_all = list(reversed(np.linspace(0, np.sqrt(eps), 1000)**2 ))
-    def constrain_fn(x, t):
-        eps_ =  eps_all[t] if (t<1000) else 0
-        for _ in range(num_steps):
-            x  = x - eps_ * ((x - ground_truth) * mask)
+#     :param target_shape_constraint: target voxels
+#     :return: constrained x
+#     '''
+#     # eps_all = list(reversed(np.linspace(0,np.float_power(eps, 1/2), 500)**2))
+#     eps_all = list(reversed(np.linspace(0, np.sqrt(eps), 1000)**2 ))
+#     def constrain_fn(x, t):
+#         eps_ =  eps_all[t] if (t<1000) else 0
+#         for _ in range(num_steps):
+#             x  = x - eps_ * ((x - ground_truth) * mask)
 
 
-        return x
-    return constrain_fn
+#         return x
+#     return constrain_fn
 
 
 # utils
@@ -387,34 +379,32 @@ def concat_all_gather(tensor):
 
 #############################################################################
 
-def get_dataset(dataroot, npoints, npoints_part, category):
-    tr_dataset = ShapeNet15kPointCloudsPart(root_dir=dataroot,
-        categories=category.split(','), split='train',
-        tr_sample_size=npoints,
-        te_sample_size=npoints,
-        tr_sample_part_size=npoints_part,
-        te_sample_part_size=npoints_part,
-        scale=1.,
-        normalize_per_shape=False,
-        normalize_std_per_axis=False,
-        random_subsample=True)
-    
-    # test datasetwill not be used in train program
-
-    # te_dataset = ShapeNet15kPointCloudsPart(root_dir=dataroot,
-    #     categories=category.split(','), split='val',
+def get_dataset(dataroot, npoints,category,use_mask=False):
+    # tr_dataset = ShapeNet15kPointCloudsPart(root_dir=dataroot,
+    #     categories=[category], split='train',
     #     tr_sample_size=npoints,
     #     te_sample_size=npoints,
     #     scale=1.,
     #     normalize_per_shape=False,
     #     normalize_std_per_axis=False,
-    #     all_points_mean=tr_dataset.all_points_mean,
-    #     all_points_std=tr_dataset.all_points_std,
-    # )
-    return tr_dataset, None
+    #     random_subsample=True, use_mask = use_mask)
+    te_dataset = ShapeNet15kPointCloudsPart(root_dir=dataroot,
+        categories=[category], split='val',
+        tr_sample_size=npoints,
+        te_sample_size=npoints,
+        scale=1.,
+        normalize_per_shape=False,
+        normalize_std_per_axis=False,
+        # all_points_mean=tr_dataset.all_points_mean,
+        # all_points_std=tr_dataset.all_points_std,
+        # all_part_points_mean=tr_dataset.all_part_points_mean,
+        # all_part_points_std=tr_dataset.all_part_points_std,
+        use_mask=use_mask
+    )
+    return None, te_dataset
 
 
-def get_dataloader(opt, train_dataset, test_dataset=None):
+def get_dataloader(opt, train_dataset=None, test_dataset=None):
 
     if opt.distribution_type == 'multi':
         train_sampler = torch.utils.data.distributed.DistributedSampler(
@@ -434,11 +424,14 @@ def get_dataloader(opt, train_dataset, test_dataset=None):
         train_sampler = None
         test_sampler = None
 
-    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=opt.bs, sampler=train_sampler,
-                                                   shuffle=train_sampler is None, num_workers=int(opt.workers), drop_last=True)
+    if train_dataset is not None:
+        train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=opt.bs,sampler=train_sampler,
+                                                    shuffle=train_sampler is None, num_workers=int(opt.workers), drop_last=True)
+    else:
+        train_dataloader = None
 
     if test_dataset is not None:
-        test_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=opt.bs,sampler=test_sampler,
+        test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=opt.bs,sampler=test_sampler,
                                                    shuffle=False, num_workers=int(opt.workers), drop_last=False)
     else:
         test_dataloader = None
@@ -446,143 +439,161 @@ def get_dataloader(opt, train_dataset, test_dataset=None):
     return train_dataloader, test_dataloader, train_sampler, test_sampler
 
 
-def generate_eval(model, opt, gpu, outf_syn, evaluator):
+# def generate_eval(model, opt, gpu, outf_syn, evaluator):
 
-    _, test_dataset = get_dataset(opt.dataroot, opt.npoints, opt.category)
+#     train_dataset, test_dataset = get_dataset(opt.dataroot, opt.npoints, opt.category)
 
-    _, test_dataloader, _, test_sampler = get_dataloader(opt, test_dataset, test_dataset)
+#     train_dataloader, test_dataloader, _, test_sampler = get_dataloader(opt, train_dataset, test_dataset)
 
 
-    def new_y_chain(device, num_chain, num_classes):
-        return torch.randint(low=0,high=num_classes,size=(num_chain,),device=device)
+#     def new_y_chain(device, num_chain, num_classes):
+#         return torch.randint(low=0,high=num_classes,size=(num_chain,),device=device)
     
-    with torch.no_grad():
+#     with torch.no_grad():
 
-        samples = []
+#         samples = []
 
-        for i, data in tqdm(enumerate(test_dataloader), total=len(test_dataloader), desc='Generating Samples'):
+#         for i, data in tqdm(enumerate(test_dataloader), total=len(test_dataloader), desc='Generating Samples'):
 
-            x = data['test_points'].transpose(1,2)
-            m, s = data['mean'].float(), data['std'].float()
-            y = data['cate_idx']
+#             x = data['test_points'].transpose(1,2)
+#             m, s = data['mean'].float(), data['std'].float()
+#             y = data['cate_idx']
             
-            gen = model.gen_samples(x.shape, gpu, new_y_chain(gpu,y.shape[0],opt.num_classes), clip_denoised=False).detach().cpu()
+#             gen = model.gen_samples(x.shape, gpu, new_y_chain(gpu,y.shape[0],opt.num_classes), clip_denoised=False).detach().cpu()
 
-            gen = gen.transpose(1,2).contiguous()
-            x = x.transpose(1,2).contiguous()
+#             gen = gen.transpose(1,2).contiguous()
+#             x = x.transpose(1,2).contiguous()
 
-            gen = gen * s + m
-            x = x * s + m
-            samples.append(gen.to(gpu).contiguous())
+#             gen = gen * s + m
+#             x = x * s + m
+#             samples.append(gen.to(gpu).contiguous())
 
-            visualize_pointcloud_batch(os.path.join(outf_syn, f'{i}_{gpu}.png'), gen, None,
-                                       None, None)
+#             visualize_pointcloud_batch(os.path.join(outf_syn, f'{i}_{gpu}.png'), gen, None,
+#                                        None, None)
             
-            # Compute metrics
-            results = compute_all_metrics(gen, x, opt.bs)
-            results = {k: (v.cpu().detach().item()
-                        if not isinstance(v, float) else v) for k, v in results.items()}
+#             # Compute metrics
+#             results = compute_all_metrics(gen, x, opt.bs)
+#             results = {k: (v.cpu().detach().item()
+#                         if not isinstance(v, float) else v) for k, v in results.items()}
 
-            jsd = JSD(gen.numpy(), x.numpy())
+#             jsd = JSD(gen.numpy(), x.numpy())
 
-            evaluator.update(results, jsd)
+#             evaluator.update(results, jsd)
 
-        stats = evaluator.finalize_stats()
+#         stats = evaluator.finalize_stats()
 
-        samples = torch.cat(samples, dim=0)
-        samples_gather = concat_all_gather(samples)
+#         samples = torch.cat(samples, dim=0)
+#         samples_gather = concat_all_gather(samples)
 
-        torch.save(samples_gather, opt.eval_path)
+#         torch.save(samples_gather, opt.eval_path)
 
-    return stats
+#     return stats
 
 def pipeline(model, opt, gpu):
 
     def new_y_chain(device, num_chain, num_classes):
         return torch.randint(low=0,high=num_classes,size=(num_chain,),device=device)
     
-    train_dataset, _ = get_dataset(opt.dataroot, opt.npoints, opt.npoints_part, opt.category)
-    dataloader, _, train_sampler, _ = get_dataloader(opt, train_dataset, None)
-    
-    # get a example from dataloader
-    data = next(iter(dataloader))
-    x = data['test_points'].transpose(1,2)
-    m, s = data['mean'].float(), data['std'].float()
-    y = data['train_partial_points'].transpose(1,2)
-
-    y_t = y.repeat(1, 1, 4)
-    y_t = y + torch.randn_like(y_t)
-
-    gen = model.gen_samples(y_t, x.shape, gpu, y, clip_denoised=False).detach().cpu()
-
-    gen = gen.transpose(1,2).contiguous()
-    x = x.transpose(1,2).contiguous()
-
-    gen = gen * s + m
-    x = x * s + m
-
-    print("generated pcd shape: ", gen.shape)
-    print("groud truth shape: ", x.shape)
-    #remove batch dim
-    gen = gen.numpy()
-    x = x.numpy()
-    y = y.numpy()
-    gen = np.squeeze(gen)
-    x = np.squeeze(x)
-    y = y.squeeze(y)
+    # _, test_dataset = get_dataset(opt.dataroot, opt.npoints, opt.category)
+    # _, test_dataloader, _, test_sampler = get_dataloader(opt, None, test_dataset)
 
 
-    gen_pcd = o3d.geometry.PointCloud()
-    gen_pcd.points = o3d.utility.Vector3dVector(gen)
+    # #get a example from dataloader
+    # data = next(iter(test_dataloader))
 
-    gt_pcd = o3d.geometry.PointCloud()
-    gt_pcd.points = o3d.utility.Vector3dVector(x)
 
-    cond_pcd = o3d.geometry.PointCloud()
-    gen_pcd.points = o3d.utility.Vector3dVector(y)
+    # load data with np.load
 
-    o3d.io.write_point_cloud("/home/yifan/studium/3D_Completion/DiT-3D_2024AILab/checkpoints/pipeline/gen_pcd.ply", gen_pcd)
-    o3d.io.write_point_cloud("/home/yifan/studium/3D_Completion/DiT-3D_2024AILab/checkpoints/pipeline/gt_pcd.ply", gt_pcd)
-    o3d.io.write_point_cloud("/home/yifan/studium/3D_Completion/DiT-3D_2024AILab/checkpoints/pipeline/cond_pcd.ply", cond_pcd)
+    pcd_full = np.load("pipeline/pcd_full.npy")
+    pcd_part = np.load("pipeline/pcd_part.npy")
+
+    # normalization
+
+    mean_full = np.mean(pcd_full, axis=0)
+    centered_points_full = pcd_full - mean_full
+    max_distance_full = np.max(np.linalg.norm(centered_points_full, axis=1))
+    pcd_full_norm = centered_points_full / max_distance_full
+
+    mean_part = np.mean(pcd_full, axis=0)
+    centered_points_part = pcd_part - mean_part
+    max_distance_part = np.max(np.linalg.norm(centered_points_part, axis=1))
+    pcd_part_norm = centered_points_part / max_distance_part
+
+    # sample 
+
+    pcd_full_idx = np.random.choice(pcd_full_norm.shape[0], 2048, replace=False)
+    pcd_full_norm = pcd_full_norm[pcd_full_idx]
+    print("the number of full pcd's points: ", pcd_full_norm.shape[0])
+
+    pcd_part_idx = np.random.choice(pcd_part_norm.shape[0], 512, replace=False)
+    pcd_part_norm = pcd_part_norm[pcd_part_idx]
+    print("the number of part pcd's points: ", pcd_part_norm.shape[0])
+
+    pcd_full_norm = torch.from_numpy(pcd_full_norm)
+    pcd_part_norm = torch.from_numpy(pcd_part_norm)
+
+    pcd_full_norm =pcd_full_norm.unsqueeze(0).transpose(1,2)
+    pcd_part_norm =pcd_part_norm.unsqueeze(0).transpose(1,2)
+
+    # n = 0
+    # x = data['test_points'][n].unsqueeze(0)
+    # m, s = data['mean'][n].unsqueeze(0), data['std'][n].unsqueeze(0)
+    # m_part ,s_part = data['part_mean'][n].unsqueeze(0), data['part_std'][n].unsqueeze(0)
+    # y = data['train_partial_points'][n].unsqueeze(0)
+
+    # x = x.transpose(1,2)
+    # m, s = m.float(), s.float()
+    # m_part, s_part = m_part.float(), s_part.float()
+    # y = y.transpose(1,2)
+
+    # gen = model.gen_samples(x.shape, gpu, y, clip_denoised=False).detach().cpu()
+
+    # gen = gen.transpose(1,2).contiguous()
+    # x = x.transpose(1,2).contiguous()
+    # part = y.transpose(1,2).contiguous()
+
+    # gen = gen * s + m
+    # x = x * s + m
+    # part= part * s_part + m_part
+
+
+
+    # #remove batch dim
+    # gen = gen.numpy()
+    # x = x.numpy()
+    # part = part.numpy()
+    # gen = np.squeeze(gen)
+    # x = np.squeeze(x)
+    # part = np.squeeze(part)
+
+    # np.save("/home/yifan/studium/3D_Completion/DiT-3D_2024AILab/checkpoints/shortOutput/part_pcd_chair.npy", part)
+    # np.save("/home/yifan/studium/3D_Completion/DiT-3D_2024AILab/checkpoints/shortOutput/gen_pcd_chair.npy", gen)
+    # np.save("/home/yifan/studium/3D_Completion/DiT-3D_2024AILab/checkpoints/shortOutput/gt_pcd_chair.npy", x)
+
+
+    # part_pcd = o3d.geometry.PointCloud()
+    # part_pcd.points = o3d.utility.Vector3dVector(part)
+
+    # gen_pcd = o3d.geometry.PointCloud()
+    # gen_pcd.points = o3d.utility.Vector3dVector(gen)
+
+    # gt_pcd = o3d.geometry.PointCloud()
+    # gt_pcd.points = o3d.utility.Vector3dVector(x)
+
+    # o3d.io.write_point_cloud("/home/yifan/studium/3D_Completion/DiT-3D_2024AILab/checkpoints/shortOutput/part_pcd_chair.ply", part_pcd)
+    # o3d.io.write_point_cloud("/home/yifan/studium/3D_Completion/DiT-3D_2024AILab/checkpoints/shortOutput/gen_pcd_chair.ply", gen_pcd)
+    # o3d.io.write_point_cloud("/home/yifan/studium/3D_Completion/DiT-3D_2024AILab/checkpoints/shortOutput/gt_pcd_chair.ply", gt_pcd)
+
                 
 def main(opt):
 
-    output_dir = get_output_dir(opt.model_dir, opt.experiment_name)
-    copy_source(__file__, output_dir)
-
-    opt.dist_url = f'tcp://{opt.node}:{opt.port}'
-    print('Using url {}'.format(opt.dist_url))
-
-    if opt.distribution_type == 'multi':
-        opt.ngpus_per_node = torch.cuda.device_count()
-        opt.world_size = opt.ngpus_per_node * opt.world_size
-        mp.spawn(test, nprocs=opt.ngpus_per_node, args=(opt, output_dir))
-    else:
-        test(opt.gpu, opt, output_dir)
+    test(opt.gpu, opt)
 
 
-def test(gpu, opt, output_dir):
+def test(gpu, opt):
 
-    logger = setup_logging(output_dir)
-
-    if opt.distribution_type == 'multi':
-        should_diag = gpu==0
-    else:
-        should_diag = True
-
-    outf_syn, = setup_output_subdirs(output_dir, 'syn')
-
-    if opt.distribution_type == 'multi':
-        if opt.dist_url == "env://" and opt.rank == -1:
-            opt.rank = int(os.environ["RANK"])
-
-        base_rank =  opt.rank * opt.ngpus_per_node
-        opt.rank = base_rank + gpu
-        dist.init_process_group(backend=opt.dist_backend, init_method=opt.dist_url,
-                                world_size=opt.world_size, rank=opt.rank)
-
-        opt.bs = int(opt.bs / opt.ngpus_per_node)
-        opt.workers = 0
+    logger = setup_logging("pipeline")
+    should_diag = True
 
     '''
     create networks
@@ -591,38 +602,25 @@ def test(gpu, opt, output_dir):
     betas = get_betas(opt.schedule_type, opt.beta_start, opt.beta_end, opt.time_num)
     model = Model(opt, betas, opt.loss_type, opt.model_mean_type, opt.model_var_type)
 
-    if opt.distribution_type == 'multi':  # Multiple processes, single GPU per process
-        def _transform_(m):
-            return nn.parallel.DistributedDataParallel(
-                m, device_ids=[gpu], output_device=gpu)
 
-        torch.cuda.set_device(gpu)
-        model.cuda(gpu)
-        model.multi_gpu_wrapper(_transform_)
+    def _transform_(m):
+        return nn.parallel.DataParallel(m)
+    model = model.cuda()
+    model.multi_gpu_wrapper(_transform_)
 
 
-    elif opt.distribution_type == 'single':
-        def _transform_(m):
-            return nn.parallel.DataParallel(m)
-        model = model.cuda()
-        model.multi_gpu_wrapper(_transform_)
-
-    elif gpu is not None:
-        torch.cuda.set_device(gpu)
-        model = model.cuda(gpu)
-    else:
-        raise ValueError('distribution_type = multi | single | None')
+    torch.cuda.set_device(gpu)
+    model = model.cuda(gpu)
 
     if should_diag:
-        logger.info(opt)
+        # logger.info(opt)
 
-        logger.info("Model = %s" % str(model))
+        # logger.info("Model = %s" % str(model))
         total_params = sum(param.numel() for param in model.parameters())/1e6
         logger.info("Total_params = %s MB " % str(total_params))    # S4: 32.81 MB
 
     model.eval()
 
-    evaluator = Evaluator(results_dir=output_dir)    
 
     with torch.no_grad():
         
@@ -631,23 +629,16 @@ def test(gpu, opt, output_dir):
 
         resumed_param = torch.load(opt.model)
         model.load_state_dict(resumed_param['model_state'])
-
-        opt.eval_path = os.path.join(outf_syn, 'samples.pth')
-        Path(opt.eval_path).parent.mkdir(parents=True, exist_ok=True)
         
-        # stats = generate_eval(model, opt, gpu, outf_syn, evaluator)
         pipeline(model, opt, gpu)
 
-        if should_diag:
-            # logger.info(stats)
-            logger.info("done")
         
 
 def parse_args():
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_dir', type=str, default='./checkpoints', help='path to save trained model weights')
-    parser.add_argument('--experiment_name', type=str, default='pipeline_car', help='experiment name (used for checkpointing and logging)')
+    parser.add_argument('--experiment_name', type=str, default='shortOutput', help='experiment name (used for checkpointing and logging)')
 
     parser.add_argument('--dataroot', default='ShapeNetCore.v2.PC15k/')
     parser.add_argument('--category', default='chair')
@@ -656,6 +647,8 @@ def parse_args():
     parser.add_argument('--bs', type=int, default=64, help='input batch size')
     parser.add_argument('--workers', type=int, default=8, help='workers')
     parser.add_argument('--niter', type=int, default=10000, help='number of epochs to train for')
+
+    parser.add_argument('--window_block_indexes', type=tuple, default='0,3,6,9')
 
     parser.add_argument('--nc', default=3)
     parser.add_argument('--npoints', default=2048)

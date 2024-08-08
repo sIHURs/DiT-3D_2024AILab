@@ -103,7 +103,7 @@ class Uniform15KPC_PART(Dataset):
 
                 # add partial points cloud
                 part_obj_file = os.path.join(root_dir, split, 'partial', subd, mid)
-                for part_obj in ['00']: # ['00', '01', '02', '03', '04', '05', '06', '07'] cuz limit of RAM
+                for part_obj in ['02']: # ['00', '01', '02', '03', '04', '05', '06', '07'] cuz limit of RAM
                     part_obj_fname = os.path.join(part_obj_file, part_obj + ".npy")
                     try:
                         part_point_cloud = np.load(part_obj_fname)
@@ -126,7 +126,7 @@ class Uniform15KPC_PART(Dataset):
 
                 
         print("all_points: ", len(self.all_points))
-        print("all_part_ points: ", len(self.all_part_points))
+        print("all_part_points: ", len(self.all_part_points))
 
         # Shuffle the index deterministically (based on the number of examples)
         self.shuffle_idx = list(range(len(self.all_points)))
@@ -252,7 +252,7 @@ class Uniform15KPC_PART(Dataset):
         te_out = torch.from_numpy(te_out[te_idxs, :]).float()
         te_part_out = torch.from_numpy(te_part_out[te_part_idxs, :]).float()
 
-        m, m_part, s, s_part = self.get_pc_stats(idx)
+        m, s, m_part, s_part = self.get_pc_stats(idx)
 
         cate_idx = self.cate_idx_lst[idx]
         sid, mid = self.all_cate_mids[idx]
