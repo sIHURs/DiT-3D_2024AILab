@@ -103,7 +103,7 @@ class Uniform15KPC_PART(Dataset):
 
                 # add partial points cloud
                 part_obj_file = os.path.join(root_dir, split, 'partial', subd, mid)
-                for part_obj in ['02']: # ['00', '01', '02', '03', '04', '05', '06', '07'] cuz limit of RAM
+                for part_obj in ['00']: # ['00', '01', '02', '03', '04', '05', '06', '07'] cuz limit of RAM
                     part_obj_fname = os.path.join(part_obj_file, part_obj + ".npy")
                     try:
                         part_point_cloud = np.load(part_obj_fname)

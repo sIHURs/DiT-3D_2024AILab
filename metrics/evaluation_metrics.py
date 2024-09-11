@@ -1,3 +1,5 @@
+import sys
+sys.path.append("/home/yifan/studium/3D_Completion/DiT-3D_2024AILab")
 import torch
 import numpy as np
 import warnings
@@ -26,7 +28,7 @@ def distChamfer(a, b):
     return P.min(1)[0], P.min(2)[0]
 
 
-def EMD_CD(sample_pcs, ref_pcs, batch_size,  reduced=True):
+def EMD_CD(sample_pcs, ref_pcs, batch_size, reduced=False):
     N_sample = sample_pcs.shape[0]
     N_ref = ref_pcs.shape[0]
     assert N_sample == N_ref, "REF:%d SMP:%d" % (N_ref, N_sample)
@@ -54,12 +56,20 @@ def EMD_CD(sample_pcs, ref_pcs, batch_size,  reduced=True):
         emd = torch.cat(emd_lst).mean()
     else:
         cd = torch.cat(cd_lst)
+        cd_variance = torch.var(cd)
         emd = torch.cat(emd_lst)
-    fs_lst = torch.cat(fs_lst).mean()
+        emd_variance = torch.var(emd)
+
+    fs_lst = torch.cat(fs_lst)
+    fs_lst_variance = torch.var(fs_lst)
+
     results = {
-        'MMD-CD': cd,
-        'MMD-EMD': emd,
-        'fscore': fs_lst
+        'CD': cd.mean(),
+        'CD_var': cd_variance,
+        'EMD': emd.mean(),
+        'EMD_var': emd_variance,
+        'fscore1': fs_lst.mean(),
+        'fscore1_var': fs_lst_variance
     }
     return results
 
@@ -300,23 +310,30 @@ def _jsdiv(P, Q):
 
 
 if __name__ == "__main__":
-    B, N = 2, 10
-    x = torch.rand(B, N, 3)
-    y = torch.rand(B, N, 3)
+    # B, N = 2, 10
+    # x = torch.rand(B, N, 3)
+    # y = torch.rand(B, N, 3)
 
-    min_l, min_r = distChamfer(x.cuda(), y.cuda())
-    print(min_l.shape)
-    print(min_r.shape)
+    # min_l, min_r = distChamfer(x.cuda(), y.cuda())
+    # print(min_l.shape)
+    # print(min_r.shape)
 
-    l_dist = min_l.mean().cpu().detach().item()
-    r_dist = min_r.mean().cpu().detach().item()
-    print(l_dist, r_dist)
+    # l_dist = min_l.mean().cpu().detach().item()
+    # r_dist = min_r.mean().cpu().detach().item()
+    # print(l_dist, r_dist)
 
 
-    emd_batch = EMD(x.cuda(), y.cuda(), False)
-    print(emd_batch.shape)
-    print(emd_batch.mean().detach().item())
+    # emd_batch = EMD(x.cuda(), y.cuda(), False)
+    # print(emd_batch.shape)
+    # print(emd_batch.mean().detach().item())
 
-    jsd = jsd_between_point_cloud_sets(x.numpy(), y.numpy())
-    print(jsd)
+    # jsd = jsd_between_point_cloud_sets(x.numpy(), y.numpy())
+    # print(jsd)
 
+    batch_size, num_channels, num_points = 3, 5, 3
+    x = torch.rand(batch_size, num_channels, num_points)  # 例如：x 的形状为 [16, 3, 1024]
+    gen = torch.rand(batch_size, num_channels, num_points)
+    results = EMD_CD(gen.to('cuda'), x.to('cuda'), batch_size, reduced=False) # True for output mean
+
+    # results = compute_all_metrics(gen, x, batch_size)
+    print(results)

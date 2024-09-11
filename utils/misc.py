@@ -30,6 +30,16 @@ class Evaluator(object):
         stats['MMD-EMD'] = np.mean(emdmmd_full_list)
 
         stats['JSD'] = np.mean(jsd_full_list)
+
+        # var
+        stats['1-NNA-CD_var'] = np.var(cd1nn_full_list)
+        stats['1-NNA-EMD_var'] = np.var(emd1nn_full_list)
+        stats['COV-CD_var'] = np.var(cdcov_full_list)
+        stats['COV-EMD_var'] = np.var(emdcov_full_list)
+        stats['MMD-CD_var'] = np.var(cdmmd_full_list)
+        stats['MMD-EMD_var'] = np.var(emdmmd_full_list)
+
+        stats['JSD_var'] = np.var(jsd_full_list)
         
         return stats
 

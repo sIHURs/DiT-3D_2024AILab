@@ -419,15 +419,15 @@ class Model(nn.Module):
                                                    window_size=args.window_size, 
                                                    window_block_indexes=args.window_block_indexes, 
                                                    num_classes=args.num_classes,
-                                                   partial_pcd=True, # condtion
-                                                   adaptformer=True
+                                                   partial_pcd=True # condtion
+                                                #    adaptformer=True
                                                 )
         else:
             self.model = DiT3D_models[args.model_type](pretrained=args.use_pretrained, 
                                                     input_size=args.voxel_size, 
                                                     num_classes=args.num_classes,
-                                                    partial_pcd=True, # condtion
-                                                    adaptformer=True
+                                                    partial_pcd=True # condtion
+                                                    # adaptformer=True
                                                     )
 
 
@@ -706,6 +706,15 @@ def train(gpu, opt, output_dir, noises_init):
         optimizer.load_state_dict(ckpt['optimizer_state'])
         print("finished load optimizer state")
 
+        if 'seed_states' in ckpt:
+            seed_states = ckpt['seed_states']
+            torch.random.set_rng_state(seed_states['torch_seed'])
+            torch.cuda.random.set_rng_state_all(seed_states['cuda_seed'])
+            np.random.set_state(seed_states['np_seed'])
+            random.setstate(seed_states['random_seed'])
+
+            print("finished load seed state")
+
     if opt.model != '':
         start_epoch = torch.load(opt.model)['epoch'] + 1
         logger.info("start epoch = %s" % str(start_epoch))
@@ -853,7 +862,13 @@ def train(gpu, opt, output_dir, noises_init):
                 save_dict = {
                     'epoch': epoch,
                     'model_state': model.state_dict(),
-                    'optimizer_state': optimizer.state_dict()
+                    'optimizer_state': optimizer.state_dict(),
+                    'seed_states': {
+                        'torch_seed': torch.random.get_rng_state(),
+                        'cuda_seed': torch.cuda.random.get_rng_state_all(),
+                        'np_seed': np.random.get_state(),
+                        'random_seed': random.getstate(),
+                    }
                 }
 
                 if opt.use_ema:

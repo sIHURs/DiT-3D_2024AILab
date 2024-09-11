@@ -398,7 +398,7 @@ def get_dataset(dataroot, npoints,category,use_mask=False):
     #     normalize_std_per_axis=False,
     #     random_subsample=True, use_mask = use_mask)
     te_dataset = ShapeNet15kPointCloudsPart(root_dir=dataroot,
-        categories=[category], split='val',
+        categories=[category], split='test',
         tr_sample_size=npoints,
         te_sample_size=npoints,
         scale=1.,
@@ -455,32 +455,56 @@ def generate_eval(model, opt, gpu, outf_syn, evaluator):
 
     def new_y_chain(device, num_chain, num_classes):
         return torch.randint(low=0,high=num_classes,size=(num_chain,),device=device)
+    print("input points:", opt.condition_npoints)
     
     with torch.no_grad():
 
         samples = []
+        samples_x = []
+        samples_y = []
 
         for i, data in tqdm(enumerate(test_dataloader), total=len(test_dataloader), desc='Generating Samples'):
 
             x = data['test_points'].transpose(1,2)
             m, s = data['mean'].float(), data['std'].float()
-            y = data['train_partial_points'].transpose(1,2)
-            
+            m_part ,s_part = data['part_mean'].float(), data['part_std'].float()
+
+            if opt.condition_npoints:
+                y = torch.zeros(x.shape[0], x.shape[1], int(opt.condition_npoints))
+
+                for j in range(x.shape[0]):
+                    indices = torch.randperm(x.shape[2])[:int(opt.condition_npoints)]
+                    y[j] = x[j, :, indices]
+
+                assert y.shape[2] == int(opt.condition_npoints)
+            else:
+                y = data['test_partial_points'].transpose(1,2)
+                assert y.shape[2] == 512
+ 
             gen = model.gen_samples(x.shape, gpu, y, clip_denoised=False).detach().cpu()
 
             gen = gen.transpose(1,2).contiguous()
             x = x.transpose(1,2).contiguous()
+            y = y.transpose(1,2).contiguous()
+
 
             gen = gen * s + m
             x = x * s + m
-            samples.append(gen.to(gpu).contiguous())
+            y = y * s_part + m_part
 
-            visualize_pointcloud_batch(os.path.join(outf_syn, f'{i}_{gpu}.png'), gen, None,
+            samples.append(gen.to(gpu).contiguous())
+            samples_x.append(x.to(gpu).contiguous())
+            samples_y.append(y.to(gpu).contiguous())
+
+            visualize_pointcloud_batch(os.path.join(outf_syn, f'{opt.condition_npoints}_{i}_{gpu}_gen.png'), gen, None,
                                        None, None)
             
-            visualize_pointcloud_batch(os.path.join(outf_syn, f'{i}_{gpu}_gt.png'), x, None,
+            visualize_pointcloud_batch(os.path.join(outf_syn, f'{opt.condition_npoints}_{i}_{gpu}_gt.png'), x, None,
                                        None, None)
             
+            visualize_pointcloud_batch(os.path.join(outf_syn, f'{opt.condition_npoints}_{i}_{gpu}_part.png'), y, None,
+                                       None, None)
+                        
             # Compute metrics
             results = compute_all_metrics(gen, x, opt.bs)
             results = {k: (v.cpu().detach().item()
@@ -494,8 +518,17 @@ def generate_eval(model, opt, gpu, outf_syn, evaluator):
 
         samples = torch.cat(samples, dim=0)
         samples_gather = concat_all_gather(samples)
+        samples_x = torch.cat(samples_x, dim=0)
+        samples_gather_x = concat_all_gather(samples_x)
+        samples_y = torch.cat(samples_y, dim=0)
+        samples_gather_y = concat_all_gather(samples_y)
 
         torch.save(samples_gather, opt.eval_path)
+        torch.save(samples_gather_x, opt.eval_path_x)
+        torch.save(samples_gather_y, opt.eval_path_y)
+        
+        results = EMD_CD(samples_gather.to('cuda'), samples_gather_x.to('cuda'), 150, reduced=False)
+        logger.info(results)
 
     return stats
                 
@@ -573,12 +606,12 @@ def test(gpu, opt, output_dir):
     else:
         raise ValueError('distribution_type = multi | single | None')
 
-    if should_diag:
-        logger.info(opt)
+    # if should_diag:
+    #     logger.info(opt)
 
-        logger.info("Model = %s" % str(model))
-        total_params = sum(param.numel() for param in model.parameters())/1e6
-        logger.info("Total_params = %s MB " % str(total_params))    # S4: 32.81 MB
+    #     logger.info("Model = %s" % str(model))
+    #     total_params = sum(param.numel() for param in model.parameters())/1e6
+    #     logger.info("Total_params = %s MB " % str(total_params))    # S4: 32.81 MB
 
     model.eval()
 
@@ -588,11 +621,15 @@ def test(gpu, opt, output_dir):
         
         if should_diag:
             logger.info("Resume Path:%s" % opt.model)
+            logger.info("The number of points from sparse points cloud:%s" % opt.condition_npoints)
 
         resumed_param = torch.load(opt.model)
         model.load_state_dict(resumed_param['model_state'])
 
-        opt.eval_path = os.path.join(outf_syn, 'samples.pth')
+        opt.eval_path = os.path.join(outf_syn, f'{opt.condition_npoints}_samples_gen.pth')
+        opt.eval_path_x = os.path.join(outf_syn, f'{opt.condition_npoints}_samples_gt.pth')
+        opt.eval_path_y = os.path.join(outf_syn, f'{opt.condition_npoints}_samples_part.pth')
+
         Path(opt.eval_path).parent.mkdir(parents=True, exist_ok=True)
         
         stats = generate_eval(model, opt, gpu, outf_syn, evaluator)
@@ -600,7 +637,7 @@ def test(gpu, opt, output_dir):
         if should_diag:
             # logger.info(stats)
             logger.info(stats)
-            logger.info("val done")
+            # logger.info("val done")
         
 
 def parse_args():
@@ -621,6 +658,7 @@ def parse_args():
 
     parser.add_argument('--nc', default=3)
     parser.add_argument('--npoints', default=2048)
+    parser.add_argument('--condition_npoints', default=None)
     parser.add_argument("--voxel_size", type=int, choices=[16, 32, 64], default=32)
 
     '''model'''

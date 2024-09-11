@@ -19,39 +19,13 @@ from models.dit3d_window_attn import DiT3D_models_WindAttn
 import open3d as o3d
 import numpy as np
 
+from metrics.evaluation_metrics import jsd_between_point_cloud_sets as JSD
+from metrics.evaluation_metrics import compute_all_metrics, EMD_CD
+from utils.misc import Evaluator
 
 '''
 models
 '''
-# def normal_kl(mean1, logvar1, mean2, logvar2):
-#     """
-#     KL divergence between normal distributions parameterized by mean and log-variance.
-#     """
-#     return 0.5 * (-1.0 + logvar2 - logvar1 + torch.exp(logvar1 - logvar2)
-#                 + (mean1 - mean2)**2 * torch.exp(-logvar2))
-
-# def discretized_gaussian_log_likelihood(x, *, means, log_scales): # X
-#     # Assumes data is integers [0, 1]
-#     assert x.shape == means.shape == log_scales.shape
-#     px0 = Normal(torch.zeros_like(means), torch.ones_like(log_scales))
-
-#     centered_x = x - means
-#     inv_stdv = torch.exp(-log_scales)
-#     plus_in = inv_stdv * (centered_x + 0.5)
-#     cdf_plus = px0.cdf(plus_in)
-#     min_in = inv_stdv * (centered_x - .5)
-#     cdf_min = px0.cdf(min_in)
-#     log_cdf_plus = torch.log(torch.max(cdf_plus, torch.ones_like(cdf_plus)*1e-12))
-#     log_one_minus_cdf_min = torch.log(torch.max(1. - cdf_min,  torch.ones_like(cdf_min)*1e-12))
-#     cdf_delta = cdf_plus - cdf_min
-
-#     log_probs = torch.where(
-#     x < 0.001, log_cdf_plus,
-#     torch.where(x > 0.999, log_one_minus_cdf_min,
-#              torch.log(torch.max(cdf_delta, torch.ones_like(cdf_delta)*1e-12))))
-#     assert log_probs.shape == x.shape
-#     return log_probs
-
 
 class GaussianDiffusion:
     def __init__(self,betas, loss_type, model_mean_type, model_var_type):
@@ -343,23 +317,6 @@ def get_betas(schedule_type, b_start, b_end, time_num):
         raise NotImplementedError(schedule_type)
     return betas
 
-# def get_constrain_function(ground_truth, mask, eps, num_steps=1):
-#     '''
-
-#     :param target_shape_constraint: target voxels
-#     :return: constrained x
-#     '''
-#     # eps_all = list(reversed(np.linspace(0,np.float_power(eps, 1/2), 500)**2))
-#     eps_all = list(reversed(np.linspace(0, np.sqrt(eps), 1000)**2 ))
-#     def constrain_fn(x, t):
-#         eps_ =  eps_all[t] if (t<1000) else 0
-#         for _ in range(num_steps):
-#             x  = x - eps_ * ((x - ground_truth) * mask)
-
-
-#         return x
-#     return constrain_fn
-
 
 # utils
 @torch.no_grad()
@@ -489,102 +446,85 @@ def get_dataloader(opt, train_dataset=None, test_dataset=None):
 
 #     return stats
 
-def pipeline(model, opt, gpu):
+def pipeline(model, opt, gpu, evaluator):
 
-    def new_y_chain(device, num_chain, num_classes):
-        return torch.randint(low=0,high=num_classes,size=(num_chain,),device=device)
-    
-    # _, test_dataset = get_dataset(opt.dataroot, opt.npoints, opt.category)
-    # _, test_dataloader, _, test_sampler = get_dataloader(opt, None, test_dataset)
+    # load example point cloud
+    pcd_full = np.load("/home/yifan/studium/3D_Completion/DiT-3D_2024AILab/datasets/data/ShapeNetCompletion/test/complete/03001627/b0531a0d44fc22144224ee0743294f79.npy")
+    print("shpae of full pcd: ", pcd_full.shape)
+    pcd_part = np.load("/home/yifan/studium/3D_Completion/DiT-3D_2024AILab/datasets/data/ShapeNetCompletion/test/partial/03001627/b0531a0d44fc22144224ee0743294f79/00.npy")
+    print("shpae of partial pcd: ", pcd_part.shape)
 
+    # sample points
+    pcd_full_idx = np.random.choice(pcd_full.shape[0], 2048, replace=False)
+    pcd_full = pcd_full[pcd_full_idx]
+    print("the number of full pcd's points: ", pcd_full.shape[0])
 
-    # #get a example from dataloader
-    # data = next(iter(test_dataloader))
+    pcd_part_idx = np.random.choice(pcd_part.shape[0], 512, replace=False)
+    pcd_part = pcd_full[pcd_part_idx]
+    print("the number of part pcd's points: ", pcd_part.shape[0])
 
-
-    # load data with np.load
-
-    pcd_full = np.load("pipeline/pcd_full.npy")
-    pcd_part = np.load("pipeline/pcd_part.npy")
 
     # normalization
 
-    mean_full = np.mean(pcd_full, axis=0)
+    use_dataset_average_norm = True
+
+    if use_dataset_average_norm: # use average mean and std from test dataset
+        mean_full = np.array([-0.0354, -0.0086, -0.0009])
+        std_full = np.array([0.1630])
+        mean_part = np.array([-0.0376, -0.0069, -0.0008])
+        std_part = np.array([0.1633])
+    else:
+        mean_full = np.mean(pcd_full, axis=0)
+        std_full = np.std(pcd_full, axis=0)
+        mean_part = np.mean(pcd_part, axis=0)
+        std_part = np.std(pcd_part, axis=0)
+
+
     centered_points_full = pcd_full - mean_full
-    max_distance_full = np.max(np.linalg.norm(centered_points_full, axis=1))
-    pcd_full_norm = centered_points_full / max_distance_full
+    # max_distance_full = np.max(np.linalg.norm(centered_points_full, axis=1))
+    pcd_full = centered_points_full / std_full
 
-    mean_part = np.mean(pcd_full, axis=0)
     centered_points_part = pcd_part - mean_part
-    max_distance_part = np.max(np.linalg.norm(centered_points_part, axis=1))
-    pcd_part_norm = centered_points_part / max_distance_part
+    # max_distance_part = np.max(np.linalg.norm(centered_points_part, axis=1))
+    pcd_part = centered_points_part / std_part
 
-    # sample 
+    # from numpy to torch
+    pcd_full = torch.from_numpy(pcd_full)
+    pcd_part = torch.from_numpy(pcd_part)
 
-    pcd_full_idx = np.random.choice(pcd_full_norm.shape[0], 2048, replace=False)
-    pcd_full_norm = pcd_full_norm[pcd_full_idx]
-    print("the number of full pcd's points: ", pcd_full_norm.shape[0])
+    # resize shape
+    pcd_full =pcd_full.unsqueeze(0).transpose(1,2).float()
+    pcd_part =pcd_part.unsqueeze(0).transpose(1,2).float()
 
-    pcd_part_idx = np.random.choice(pcd_part_norm.shape[0], 512, replace=False)
-    pcd_part_norm = pcd_part_norm[pcd_part_idx]
-    print("the number of part pcd's points: ", pcd_part_norm.shape[0])
+    # predict
+    gen = model.gen_samples(pcd_full.shape, gpu, pcd_part, clip_denoised=False).detach().cpu()
 
-    pcd_full_norm = torch.from_numpy(pcd_full_norm)
-    pcd_part_norm = torch.from_numpy(pcd_part_norm)
+    # resize, denormalization, from torch to numpy
+    gen = gen.transpose(1,2).contiguous()
+    pcd_full = pcd_full.transpose(1,2).contiguous()
+    pcd_part = pcd_part.transpose(1,2).contiguous()
 
-    pcd_full_norm =pcd_full_norm.unsqueeze(0).transpose(1,2)
-    pcd_part_norm =pcd_part_norm.unsqueeze(0).transpose(1,2)
+    gen = gen * std_full + mean_full
+    full = pcd_full * std_full + mean_full
+    part= pcd_part * std_part + mean_part
 
-    # n = 0
-    # x = data['test_points'][n].unsqueeze(0)
-    # m, s = data['mean'][n].unsqueeze(0), data['std'][n].unsqueeze(0)
-    # m_part ,s_part = data['part_mean'][n].unsqueeze(0), data['part_std'][n].unsqueeze(0)
-    # y = data['train_partial_points'][n].unsqueeze(0)
+    # Compute CD, EMD, F1
+    results = EMD_CD(gen.float().to('cuda'), full.float().to('cuda'), 1, reduced=True)
 
-    # x = x.transpose(1,2)
-    # m, s = m.float(), s.float()
-    # m_part, s_part = m_part.float(), s_part.float()
-    # y = y.transpose(1,2)
-
-    # gen = model.gen_samples(x.shape, gpu, y, clip_denoised=False).detach().cpu()
-
-    # gen = gen.transpose(1,2).contiguous()
-    # x = x.transpose(1,2).contiguous()
-    # part = y.transpose(1,2).contiguous()
-
-    # gen = gen * s + m
-    # x = x * s + m
-    # part= part * s_part + m_part
+    gen = gen.numpy()
+    full = full.numpy()
+    part = part.numpy()
+    gen = np.squeeze(gen)
+    full = np.squeeze(full)
+    part = np.squeeze(part)
 
 
+    np.save("/home/yifan/studium/3D_Completion/DiT-3D_2024AILab/pipeline/part_pcd_chair.npy", part)
+    np.save("/home/yifan/studium/3D_Completion/DiT-3D_2024AILab/pipeline/gen_averagenorm_pcd_chair.npy", gen)
+    np.save("/home/yifan/studium/3D_Completion/DiT-3D_2024AILab/pipeline/gt_pcd_chair.npy", full)
 
-    # #remove batch dim
-    # gen = gen.numpy()
-    # x = x.numpy()
-    # part = part.numpy()
-    # gen = np.squeeze(gen)
-    # x = np.squeeze(x)
-    # part = np.squeeze(part)
-
-    # np.save("/home/yifan/studium/3D_Completion/DiT-3D_2024AILab/checkpoints/shortOutput/part_pcd_chair.npy", part)
-    # np.save("/home/yifan/studium/3D_Completion/DiT-3D_2024AILab/checkpoints/shortOutput/gen_pcd_chair.npy", gen)
-    # np.save("/home/yifan/studium/3D_Completion/DiT-3D_2024AILab/checkpoints/shortOutput/gt_pcd_chair.npy", x)
-
-
-    # part_pcd = o3d.geometry.PointCloud()
-    # part_pcd.points = o3d.utility.Vector3dVector(part)
-
-    # gen_pcd = o3d.geometry.PointCloud()
-    # gen_pcd.points = o3d.utility.Vector3dVector(gen)
-
-    # gt_pcd = o3d.geometry.PointCloud()
-    # gt_pcd.points = o3d.utility.Vector3dVector(x)
-
-    # o3d.io.write_point_cloud("/home/yifan/studium/3D_Completion/DiT-3D_2024AILab/checkpoints/shortOutput/part_pcd_chair.ply", part_pcd)
-    # o3d.io.write_point_cloud("/home/yifan/studium/3D_Completion/DiT-3D_2024AILab/checkpoints/shortOutput/gen_pcd_chair.ply", gen_pcd)
-    # o3d.io.write_point_cloud("/home/yifan/studium/3D_Completion/DiT-3D_2024AILab/checkpoints/shortOutput/gt_pcd_chair.ply", gt_pcd)
-
-                
+    return results
+      
 def main(opt):
 
     test(opt.gpu, opt)
@@ -592,7 +532,8 @@ def main(opt):
 
 def test(gpu, opt):
 
-    logger = setup_logging("pipeline")
+    logger = setup_logging("/home/yifan/studium/3D_Completion/DiT-3D_2024AILab/pipeline")
+
     should_diag = True
 
     '''
@@ -613,26 +554,28 @@ def test(gpu, opt):
     model = model.cuda(gpu)
 
     if should_diag:
-        # logger.info(opt)
 
-        # logger.info("Model = %s" % str(model))
         total_params = sum(param.numel() for param in model.parameters())/1e6
-        logger.info("Total_params = %s MB " % str(total_params))    # S4: 32.81 MB
+        print("Total_params = %s MB " % str(total_params))    # S4: 32.81 MB
 
-    model.eval()
+    model.eval() 
 
+    evaluator = Evaluator()
 
     with torch.no_grad():
         
         if should_diag:
-            logger.info("Resume Path:%s" % opt.model)
+            print("Resume Path:%s" % opt.model)
 
         resumed_param = torch.load(opt.model)
         model.load_state_dict(resumed_param['model_state'])
         
-        pipeline(model, opt, gpu)
+        stats = pipeline(model, opt, gpu, evaluator)
 
-        
+        if should_diag:
+            # logger.info(stats)
+            logger.info(stats)
+            # logger.info("val done")
 
 def parse_args():
 
